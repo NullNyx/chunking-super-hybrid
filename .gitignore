@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Project-specific: large binary/output files
+outputs/
+logs/
+assets/prototypes_heading.pt
+
+# Temporary work dirs
+_work_tmp/
+
+# Large PDF datasets (not for version control)
+toan/
+*.pdf
