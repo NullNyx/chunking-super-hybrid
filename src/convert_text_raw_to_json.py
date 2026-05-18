@@ -124,8 +124,9 @@ def split_by_heading(raw: str) -> List[Tuple[str, str]]:
     out: List[Tuple[str, str]] = []
     for h, buf in sections:
         content = normalize_text("\n".join(buf))
-        if content:
-            out.append((h, content))
+        # Keep sections even if content is empty — they serve as lesson boundaries
+        # (e.g. "Bài 30. Mi-li-mét" may have no content between it and next heading)
+        out.append((h, content if content else h))
 
     return out
 

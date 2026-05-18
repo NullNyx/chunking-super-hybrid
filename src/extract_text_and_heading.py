@@ -789,21 +789,20 @@ def inject_headings(
             title_words = title_norm.split()
             line_words = line_norm.split()
 
-            # For very short titles (1-3 words): require exact match of the full line
+            # For very short titles (1-3 words): require title appears at start of line
+            # or line equals title exactly
             if len(title_words) <= 3:
-                return line_norm == title_norm
+                return line_norm == title_norm or line_norm.startswith(title_norm + " ") or line_norm.startswith(title_norm)
 
             # For longer titles: require 85%+ word overlap AND title covers
-            # at least 50% of the line (avoids matching inside long sentences)
+            # at least 40% of the line (avoids matching inside long sentences)
             if title_norm in line_norm:
-                # Substring match — but check it's not a tiny part of a long line
-                if len(title_norm) >= len(line_norm) * 0.5:
+                if len(title_norm) >= len(line_norm) * 0.4:
                     return True
 
             # Fuzzy word overlap
             matches = sum(1 for w in title_words if w in line_norm)
             overlap = matches / len(title_words)
-            # Also check line isn't way longer than title (avoid matching sentences)
             length_ratio = len(title_norm) / max(len(line_norm), 1)
             return overlap >= 0.85 and length_ratio >= 0.4
 
@@ -839,18 +838,45 @@ def inject_headings(
                             out_lines.append(f"## Heading: Bài {skipped_lesson}. {skipped_title}")
                             count += 1
 
-                        # Inject the matched title
+                        # Inject the matched title (always, regardless of previous line)
                         next_lesson, next_title = title_queue.popleft()
-                        if out_lines and not out_lines[-1].strip().startswith("## Heading:"):
-                            out_lines.append(f"## Heading: Bài {next_lesson}. {next_title}")
-                            count += 1
+                        out_lines.append(f"## Heading: Bài {next_lesson}. {next_title}")
+                        count += 1
 
             out_lines.append(line)
 
-        # Report unmatched
+        # Post-process: inject remaining unmatched titles between existing headings
         if title_queue:
-            unmatched = [f"Bài {n}" for n, _ in title_queue]
-            print(f"  [WARN] {len(unmatched)} lessons not found in body: {', '.join(unmatched[:10])}", flush=True)
+            remaining = list(title_queue)
+            title_queue.clear()
+
+            # Find positions of already-injected headings
+            heading_positions: List[Tuple[int, int]] = []  # (line_idx, lesson_num)
+            _HDG_RE = re.compile(r"## Heading: Bài (\d+)\.")
+            for idx, line in enumerate(out_lines):
+                m = _HDG_RE.search(line)
+                if m:
+                    heading_positions.append((idx, int(m.group(1))))
+
+            # For each remaining lesson, find where it should go
+            # (after the heading with the largest lesson_num < this one)
+            inserts: List[Tuple[int, str]] = []  # (insert_after_idx, heading_text)
+            for rem_lesson, rem_title in remaining:
+                # Find the heading just before this lesson number
+                best_idx = toc_end_line + 1  # default: right after TOC
+                for pos_idx, pos_lesson in heading_positions:
+                    if pos_lesson < rem_lesson:
+                        best_idx = pos_idx
+                    else:
+                        break
+                inserts.append((best_idx, f"## Heading: Bài {rem_lesson}. {rem_title}"))
+                count += 1
+
+            # Insert in reverse order to preserve indices
+            for insert_idx, heading_text in sorted(inserts, key=lambda x: x[0], reverse=True):
+                out_lines.insert(insert_idx + 1, heading_text)
+
+            print(f"  [INFO] {len(remaining)} lessons injected by position estimate: {', '.join(f'Bài {n}' for n, _ in remaining)}", flush=True)
 
         return "\n".join(out_lines), count
 
