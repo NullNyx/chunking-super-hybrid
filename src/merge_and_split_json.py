@@ -809,8 +809,8 @@ def process_json_folder(
 
 if __name__ == "__main__":
     process_json_folder(
-        input_root=r"E:\QuangNV\Chunking_Final\z\chunking_super_hybrid\outputs\chunking_08012026_v0\02_convert_json_raw",
-        output_root=r"E:\QuangNV\Chunking_Final\z\chunking_super_hybrid\outputs\chunking_08012026_v0\03_chunked_v2",
+        input_root=r".\outputs\02_convert_json_raw",
+        output_root=r".\outputs\03_chunked_raw",
         min_tokens=MIN_TOKENS,
         target_tokens=TARGET_TOKENS,
         max_tokens=MAX_TOKENS,

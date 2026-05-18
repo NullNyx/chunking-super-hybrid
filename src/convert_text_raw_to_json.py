@@ -59,16 +59,18 @@ def split_by_heading(raw: str) -> List[Tuple[str, str]]:
 
     Rules:
     - Text before first heading -> attach to the first heading (nearest).
-    - Subheadings (Câu lệnh/Câu hỏi/Tìm hiểu/Nhận biết) -> merge into previous heading (no new item).
+    - Subheadings (Câu lệnh) -> merge into previous heading (no new item).
+    - "Câu hỏi" is kept as a normal heading (not subheading) since it may be
+      the only CLIP-detected heading in some textbooks.
     - Text outside headings -> attach to the nearest previous (effective) heading.
     - If no heading exists -> one chunk with heading "UNKNOWN".
     """
 
-    # Các heading sẽ được coi là subheading và nhập vào heading trước đó
-    SUBHEADINGS = {"câu lệnh", "câu hỏi"}
+    # Chỉ "câu lệnh" là subheading thật sự (merge vào heading trước)
+    # "câu hỏi" giữ lại vì có thể là heading duy nhất CLIP detect được
+    SUBHEADINGS = {"câu lệnh"}
 
     def _norm_heading(h: str) -> str:
-        # normalize để so sánh chắc chắn (không phân biệt hoa thường, dư khoảng trắng)
         return re.sub(r"\s+", " ", h.strip().lower())
 
     lines = raw.splitlines()
@@ -129,6 +131,12 @@ def split_by_heading(raw: str) -> List[Tuple[str, str]]:
 
 
 def parse_lesson_from_content(raw: str) -> Optional[int]:
+    """Parse lesson number from the FIRST 'Bài X' that appears as a standalone line/heading."""
+    # Prefer heading-style "Bài X." at start of line (not inside table/sentence)
+    m = re.search(r"^\s*Bài\s+(\d+)\b", raw, re.IGNORECASE | re.MULTILINE)
+    if m:
+        return int(m.group(1))
+    # Fallback: any "BÀI X" in text
     m = re.search(r"\bBÀI\s*(\d+)\b", raw, re.IGNORECASE)
     return int(m.group(1)) if m else None
 
@@ -137,29 +145,65 @@ def build_chunks_for_file(
     txt_path: Path,
     input_root: Path,
     chunk_version: str = "v1",
+    default_types: str = "LT",
 ) -> List[Dict]:
     """
     Expect path like:
     <root>/<subject>/<kb_folder>/<types>/<file>.txt
     e.g. results_v1/htlt/Lop1/general/lesson4.txt
+
+    If path has fewer levels (e.g. toan/Toan_3_Tap_1.txt), infer:
+      - kb_folder (grade) from filename pattern "_{grade}_"
+      - types defaults to default_types
     """
     rel = txt_path.relative_to(input_root)
     parts = rel.parts
 
-    subject = parts[0] if len(parts) >= 1 else "unknown"
-    kb_folder = parts[1] if len(parts) >= 2 else "unknown"
-    types = parts[2] if len(parts) >= 3 else "unknown"   # nếu chỉ có 2-3 level thì vẫn ok
+    if len(parts) >= 4:
+        # Full structure: subject/kb_folder/types/file.txt
+        subject = parts[0]
+        kb_folder = parts[1]
+        types = parts[2]
+    elif len(parts) == 3:
+        # subject/kb_folder/file.txt — no types subfolder
+        subject = parts[0]
+        kb_folder = parts[1]
+        types = default_types
+    elif len(parts) == 2:
+        # subject/file.txt — infer grade from filename
+        subject = parts[0]
+        # Try to extract grade from filename like "Toan_3_Tap_1.txt"
+        grade_match = re.search(r"[_\s](\d{1,2})[_\s]", parts[1])
+        if grade_match:
+            kb_folder = f"Lop{grade_match.group(1)}"
+        else:
+            kb_folder = "unknown"
+        types = default_types
+    else:
+        subject = "unknown"
+        kb_folder = "unknown"
+        types = default_types
+
     rel_file = str(rel)
     kb_id = parse_kb_id(kb_folder)
     raw = txt_path.read_text(encoding="utf-8", errors="ignore")
-    lesson = parse_lesson_from_content(raw) or parse_lesson(txt_path.stem)
+    file_lesson = parse_lesson_from_content(raw) or parse_lesson(txt_path.stem)
     sections = split_by_heading(raw)
 
     # chunk_order theo heading (nếu heading lặp lại nhiều lần thì order tăng)
     heading_counters: Dict[str, int] = {}
 
+    # Track current lesson: update when heading contains "Bài X"
+    _LESSON_IN_HEADING_RE = re.compile(r"\bBài\s+(\d+)\b", re.IGNORECASE)
+    current_lesson = file_lesson
+
     chunks: List[Dict] = []
     for heading, content in sections:
+        # Try to extract lesson number from heading name (e.g. "Bài 5. Bảng nhân 3")
+        lm = _LESSON_IN_HEADING_RE.search(heading)
+        if lm:
+            current_lesson = int(lm.group(1))
+
         heading_counters[heading] = heading_counters.get(heading, 0) + 1
         chunk_order = heading_counters[heading]
 
@@ -169,14 +213,13 @@ def build_chunks_for_file(
             "kb_id": kb_id,                 # Lop1 -> 1
             "subject": subject,             # htlt
             "types": types,                 # general / LT / TH
-            "lesson": lesson,               # lesson4.txt -> 4
+            "lesson": current_lesson,       # per-section lesson number
             "chunk_version": chunk_version, # v1 / v2 ...
             "chunk_order": chunk_order,     # per-heading order
             "chunk_id": chunk_id,
             "heading": heading,
             "length": len(content),         # char count
             "length_token": safe_token_count(content),
-            # "source_file": rel_file,        # traceability
         }
 
         chunks.append({"metadata": meta, "page_content": content})

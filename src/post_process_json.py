@@ -165,8 +165,8 @@ def strip_metadata_fields(meta: Dict[str, Any], *, enabled: bool = True) -> Dict
 
 if __name__ == "__main__":
     merge_all_lessons_to_one_json(
-        input_root=r"E:\QuangNV\Chunking_Final\z\chunking_super_hybrid\outputs\chunking_08012026_v0\03_chunked_v2",
-        output_root=r"E:\QuangNV\Chunking_Final\z\chunking_super_hybrid\outputs\chunking_08012026_v0\04_dataset_09012026",
+        input_root=r".\outputs\03_chunked_raw",
+        output_root=r".\outputs\04_merged_all",
         out_version="v3",
         strip_meta_fields=True,   # <-- bật xoá
     )

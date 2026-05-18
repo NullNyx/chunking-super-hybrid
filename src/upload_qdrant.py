@@ -476,6 +476,6 @@ def upload_folder_merged_books_to_qdrant_fast(input_root: str) -> None:
 # ENTRY POINT
 # =====================================================
 if __name__ == "__main__":
-    input_root = r"E:\QuangNV\Chunking_Final\z\chunking_super_hybrid\outputs\chunking_08012026_v0\04_dataset_09012026"
+    input_root = r".\outputs\04_merged_all"
     # upload_folder_merged_books_to_qdrant_fast(input_root)
     upload_folder_parallel(input_root, max_workers=1)

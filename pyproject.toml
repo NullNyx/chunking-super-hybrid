@@ -1,0 +1,70 @@
+[project]
+name = "chunking-super-hybrid"
+version = "1.0.0"
+description = "Pipeline chunking PDF sách giáo khoa tiếng Việt → JSON → Qdrant"
+requires-python = ">=3.11,<3.13"
+
+# Versions pinned to match the verified working environment (CUDA cu124, Python 3.11).
+# Use `uv sync` to install; use `uv sync --extra upload` to also install Qdrant deps.
+dependencies = [
+    # PDF extraction
+    "docling==2.31.0",
+    "docling-core==2.75.0",
+
+    # CLIP heading detection
+    # torch / torchvision come from the PyTorch CUDA 12.4 index (see [tool.uv.sources]).
+    "torch==2.6.0",
+    "torchvision==0.21.0",
+    "transformers==4.57.6",
+    "Pillow==11.3.0",
+
+    # Token counting
+    "tiktoken==0.13.0",
+
+    # Progress bar
+    "tqdm==4.67.3",
+
+    # Fast HuggingFace downloads (Xet protocol)
+    "hf-xet>=1.0",
+]
+
+[project.optional-dependencies]
+upload = [
+    # Only needed for src/upload_qdrant.py
+    "qdrant-client>=1.7.0",
+    "fastembed>=0.2.0",
+    "langchain-huggingface>=0.0.3",
+    "underthesea>=6.8.0",
+]
+
+# Console scripts -> available via `uv run <name>`
+[project.scripts]
+chunk-pipeline = "src.cli:main"
+chunk-check-env = "src.check_env:main"
+chunk-export = "src.export_zip:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Package layout: ship only the `src/` package. The root `main.py` is just a
+# thin shim that imports from `src.cli`; we deliberately do NOT ship it into
+# site-packages, otherwise `python -m site_packages.main` would shadow the
+# editable source tree.
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.uv]
+required-version = ">=0.11.0"
+
+# Pull torch / torchvision from PyTorch's CUDA 12.4 wheel index.
+# This keeps `+cu124` builds across machines and prevents `uv sync` from
+# silently downgrading to CPU wheels.
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }

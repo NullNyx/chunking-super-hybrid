@@ -20,10 +20,30 @@ from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling_core.types.doc import ImageRefMode
 from functools import lru_cache
 
+
+@lru_cache(maxsize=4)
+def _get_docling_converter(images_scale: float = 1.2, generate_picture_images: bool = True):
+    """Cache the DocumentConverter so layout model is loaded only once."""
+    pipeline_options = PdfPipelineOptions()
+    pipeline_options.do_ocr = False
+    pipeline_options.images_scale = images_scale
+    pipeline_options.generate_page_images = False
+    pipeline_options.generate_picture_images = generate_picture_images
+    return DocumentConverter(
+        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
+    )
+
+
 @lru_cache(maxsize=2)
 def _get_clip_bundle(device: str):
+    import time as _t
+    t0 = _t.time()
     model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device).eval()
-    processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+    # Use half precision on CUDA for ~2x speedup
+    if "cuda" in device:
+        model = model.half()
+    processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32", use_fast=True)
+    print(f"  [CLIP model loaded in {_t.time()-t0:.1f}s on {device}]", flush=True)
     return model, processor
 
 
@@ -339,12 +359,14 @@ def extract_pdf_no_ocr(
 
     # Docling pipeline options (NO OCR)
     pipeline_options = PdfPipelineOptions()
+    pipeline_options.do_ocr = False  # disable EasyOCR (also avoids model download)
     pipeline_options.images_scale = 1.2 if test_fast else 2.0
     pipeline_options.generate_page_images = False
     pipeline_options.generate_picture_images = True
 
-    converter = DocumentConverter(
-        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
+    converter = _get_docling_converter(
+        images_scale=pipeline_options.images_scale,
+        generate_picture_images=True,
     )
 
     res = converter.convert(pdf_path)
@@ -481,29 +503,56 @@ def clip_label_images(
     """
     Label images by CLIP cosine similarity with prototype embeddings.
     Only keep hits >= score_threshold.
+    Uses batch inference for speed on GPU.
     """
+    if not image_paths:
+        return []
+
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
     labels, proto_mat_cpu = _get_prototypes_cached(str(Path(prototypes_path).resolve()))
     model, processor = _get_clip_bundle(device)
 
-    hits: List[ClipHit] = []
+    # Load and preprocess all images
+    valid_paths: List[Path] = []
+    pil_images: List[Image.Image] = []
     for p in image_paths:
         try:
-            label, score = predict_label_for_image(
-                p,
-                model=model,
-                processor=processor,
-                labels=labels,
-                proto_mat_cpu=proto_mat_cpu,
-                device=device,
-            )
-            if score >= score_threshold:
-                hits.append(ClipHit(image_path=str(p), label=label, score=score))
+            img = Image.open(p).convert("RGB")
+            img = pad_to_square(img)
+            pil_images.append(img)
+            valid_paths.append(p)
         except Exception:
-            # Ignore broken images
             continue
+
+    if not pil_images:
+        return []
+
+    # Batch inference (process all images at once — much faster on GPU)
+    BATCH_SIZE = 16
+    hits: List[ClipHit] = []
+
+    for i in range(0, len(pil_images), BATCH_SIZE):
+        batch_imgs = pil_images[i:i + BATCH_SIZE]
+        batch_paths = valid_paths[i:i + BATCH_SIZE]
+
+        inputs = processor(images=batch_imgs, return_tensors="pt", padding=True)
+        # Cast to half precision if model is fp16 (CUDA)
+        inputs = {k: v.to(device).half() if v.is_floating_point() and "cuda" in device else v.to(device) for k, v in inputs.items()}
+
+        with torch.inference_mode():
+            feats = model.get_image_features(**inputs)
+            feats = F.normalize(feats, dim=1).float().cpu()  # [B, D] — cast back to float32 for matmul with prototypes
+
+        # Cosine similarity against prototypes
+        sims = feats @ proto_mat_cpu.T  # [B, C]
+
+        for j, (path, sim_row) in enumerate(zip(batch_paths, sims)):
+            best_idx = int(torch.argmax(sim_row).item())
+            score = float(sim_row[best_idx].item())
+            if score >= score_threshold:
+                hits.append(ClipHit(image_path=str(path), label=labels[best_idx], score=score))
 
     return hits
 
@@ -668,6 +717,146 @@ def inject_headings(
     # Remove other markdown headings to avoid interference
     text = OTHER_MD_HEADING_RE.sub("", text)
 
+    # --- Text-based heading injection ---
+    # Detect "Bài X" patterns as lesson boundaries.
+    # These are structural headings in Vietnamese textbooks that CLIP may miss.
+    _BAI_RE = re.compile(
+        r"^(Bài\s+\d+.*)$",
+        re.IGNORECASE | re.MULTILINE,
+    )
+
+    def _inject_text_headings(txt: str) -> Tuple[str, int]:
+        """
+        Two-pass heading injection using TOC (table of contents):
+        1. Parse TOC to get ordered list of (lesson_num, title)
+        2. Scan body text sequentially, matching titles in order.
+           Each title is matched ONCE then removed from the queue.
+           This handles duplicate titles (e.g. "Luyện tập chung" appears 5+ times).
+        """
+        count = 0
+        lines = txt.splitlines()
+
+        # --- Pass 1: Parse TOC ---
+        _TOC_RE = re.compile(
+            r"\|\s*\|\s*Bài\s+(\d+)\.\s*(.+?)\s*\|\s*(\d+)\s*\|"
+        )
+        toc_entries: List[Tuple[int, str]] = []  # ordered (lesson_num, title)
+        toc_end_line = 0
+
+        for i, line in enumerate(lines):
+            m = _TOC_RE.search(line)
+            if m:
+                lesson_num = int(m.group(1))
+                title = m.group(2).strip()
+                toc_entries.append((lesson_num, title))
+                toc_end_line = i
+
+        if not toc_entries:
+            # Fallback: match "Bài X" standalone lines
+            out_lines: List[str] = []
+            seen_lessons: set = set()
+            for line in lines:
+                stripped = line.strip()
+                if "|" in stripped:
+                    out_lines.append(line)
+                    continue
+                m2 = re.search(r"(Bài\s+(\d+)\b.*)", stripped, re.IGNORECASE)
+                if m2 and len(stripped) < 120:
+                    ln = int(m2.group(2))
+                    if ln not in seen_lessons:
+                        seen_lessons.add(ln)
+                        if out_lines and not out_lines[-1].strip().startswith("## Heading:"):
+                            out_lines.append(f"## Heading: {m2.group(1).strip()}")
+                            count += 1
+                out_lines.append(line)
+            return "\n".join(out_lines), count
+
+        # --- Pass 2: Sequential matching ---
+        # Queue of titles to find, in order
+        import collections
+        title_queue = collections.deque(toc_entries)
+
+        def _normalize(s: str) -> str:
+            """Normalize for comparison: uppercase, collapse whitespace, strip punctuation."""
+            s = re.sub(r"\s+", " ", s.upper().strip())
+            # Remove common punctuation that may differ
+            s = re.sub(r"[,;:\.\-–—]", " ", s)
+            s = re.sub(r"\s+", " ", s).strip()
+            return s
+
+        def _is_match(line_norm: str, title_norm: str) -> bool:
+            """Check if line IS the title (not just contains it as substring)."""
+            title_words = title_norm.split()
+            line_words = line_norm.split()
+
+            # For very short titles (1-3 words): require exact match of the full line
+            if len(title_words) <= 3:
+                return line_norm == title_norm
+
+            # For longer titles: require 85%+ word overlap AND title covers
+            # at least 50% of the line (avoids matching inside long sentences)
+            if title_norm in line_norm:
+                # Substring match — but check it's not a tiny part of a long line
+                if len(title_norm) >= len(line_norm) * 0.5:
+                    return True
+
+            # Fuzzy word overlap
+            matches = sum(1 for w in title_words if w in line_norm)
+            overlap = matches / len(title_words)
+            # Also check line isn't way longer than title (avoid matching sentences)
+            length_ratio = len(title_norm) / max(len(line_norm), 1)
+            return overlap >= 0.85 and length_ratio >= 0.4
+
+        out_lines: List[str] = []
+        LOOK_AHEAD = 12  # Check up to 12 titles ahead in queue
+
+        for i, line in enumerate(lines):
+            # Only search body text (after TOC)
+            if i > toc_end_line and title_queue:
+                stripped = line.strip()
+                # Skip table lines, empty lines, already-injected headings
+                if (stripped
+                    and "|" not in stripped
+                    and not stripped.startswith("## Heading:")
+                    and not stripped.startswith("## ")
+                    and len(stripped) >= 5):
+
+                    line_norm = _normalize(stripped)
+                    # Check against next N titles in queue (look-ahead)
+                    matched_idx = -1
+                    for qi in range(min(LOOK_AHEAD, len(title_queue))):
+                        _, candidate_title = title_queue[qi]
+                        candidate_norm = _normalize(candidate_title)
+                        if _is_match(line_norm, candidate_norm):
+                            matched_idx = qi
+                            break
+
+                    if matched_idx >= 0:
+                        # Pop all skipped titles (they weren't found)
+                        for _ in range(matched_idx):
+                            skipped_lesson, skipped_title = title_queue.popleft()
+                            # Still inject heading for skipped lessons at current position
+                            out_lines.append(f"## Heading: Bài {skipped_lesson}. {skipped_title}")
+                            count += 1
+
+                        # Inject the matched title
+                        next_lesson, next_title = title_queue.popleft()
+                        if out_lines and not out_lines[-1].strip().startswith("## Heading:"):
+                            out_lines.append(f"## Heading: Bài {next_lesson}. {next_title}")
+                            count += 1
+
+            out_lines.append(line)
+
+        # Report unmatched
+        if title_queue:
+            unmatched = [f"Bài {n}" for n, _ in title_queue]
+            print(f"  [WARN] {len(unmatched)} lessons not found in body: {', '.join(unmatched[:10])}", flush=True)
+
+        return "\n".join(out_lines), count
+
+    text, text_headings_count = _inject_text_headings(text)
+    inserted += text_headings_count
+
     # Compact formatting
     text = compact_newlines(text)
     text = compact_paragraphs_keep_lists_and_headings(text)
@@ -733,7 +922,14 @@ def run_one_pdf(
     out_dir = Path(out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    import time as _time
+    _t0 = _time.time()
+    def _log(msg: str) -> None:
+        elapsed = _time.time() - _t0
+        print(f"  [{elapsed:6.1f}s] {pdf_path.name}: {msg}", flush=True)
+
     # (1) Extract
+    _log("Docling extract (no OCR) ...")
     ex = extract_pdf_no_ocr(
         pdf_path,
         n_pages=n_pages,
@@ -741,6 +937,7 @@ def run_one_pdf(
         test_fast=test_fast,
         keep_docling_dir=keep_docling_dir,
     )
+    _log(f"Extract done — {len(ex.images)} images found")
 
     (out_dir / "raw_text.txt").write_text(ex.raw_text, encoding="utf-8")
     (out_dir / "raw_with_images.txt").write_text(ex.raw_with_images, encoding="utf-8")
@@ -748,6 +945,7 @@ def run_one_pdf(
 
     # (2) CLIP labeling
     image_paths = collect_images_for_clip(ex=ex, pdf_path=pdf_path, label_mode=label_mode)
+    _log(f"CLIP labeling {len(image_paths)} images ...")
 
     hits = clip_label_images(
         image_paths,
@@ -755,6 +953,7 @@ def run_one_pdf(
         score_threshold=clip_score_threshold,
         device=clip_device,
     )
+    _log(f"CLIP done — {len(hits)} hits")
 
     labels_tsv_path = out_dir / "labels.tsv"
     clip_hits_path = out_dir / "clip_hits.json"
@@ -762,6 +961,7 @@ def run_one_pdf(
     clip_hits_path.write_text(json.dumps([h.__dict__ for h in hits], ensure_ascii=False, indent=2), encoding="utf-8")
 
     # (3) Inject headings
+    _log("Injecting headings ...")
     final_text, inserted, dropped = inject_headings(
         label_tsv_path=labels_tsv_path,
         text_with_images=ex.raw_with_images,
@@ -769,6 +969,7 @@ def run_one_pdf(
         drop_unlabeled_images=drop_unlabeled_images,
     )
     (out_dir / "raw_with_headings.txt").write_text(final_text, encoding="utf-8")
+    _log(f"Done — {inserted} headings inserted, {dropped} images dropped")
 
     # (4) Meta
     meta = {
@@ -797,14 +998,14 @@ def run_one_pdf(
 # =========================================================
 if __name__ == "__main__":
     meta = run_one_pdf(
-        pdf_path=r"E:\QuangNV\Matching_book_logic\GDCD\CDHT GDKTPL 12 CTST (Ruot ITB 17.02.25).pdf",
-        out_dir=r"E:\QuangNV\Matching_book_logic\GDCD_export",
-        prototypes_path=r"E:\AIBuddy\dev2\v1\book-chunking\chunking_super_hybrid\assets\prototypes_heading.pt",
+        pdf_path=r".\input\sample.pdf",
+        out_dir=r".\outputs\sample_export",
+        prototypes_path=r".\assets\prototypes_heading.pt",
         n_pages=None,
         test_fast=True,
         keep_docling_dir=True,
         clip_score_threshold=0.9,
-        path_labels_heading=r"E:\AIBuddy\dev2\v1\book-chunking\chunking_super_hybrid\assets\labels_heading.json",
+        path_labels_heading=r".\assets\labels_heading.json",
         clip_device=None,
         drop_unlabeled_images=True,
         label_mode="artifacts",   # change to "referenced" if you want tighter mapping for injection
