@@ -9,6 +9,7 @@ build/
 
 # Virtual environments
 .venv/
+.venv_*/
 venv/
 env/
 
@@ -21,6 +22,10 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 
+# Test caches
+.hypothesis/
+.pytest_cache/
+
 # Project-specific: large binary/output files
 outputs/
 logs/
@@ -30,5 +35,5 @@ assets/prototypes_heading.pt
 _work_tmp/
 
 # Large PDF datasets (not for version control)
-toan/
+input/
 *.pdf

@@ -70,6 +70,9 @@ uv run chunk-export            # Chỉ chạy B5 (nếu B1-B4 đã có)
 - `src/post_process_json.py` — B4: Merge
 - `src/page_split.py` — B5: Page-based split + clean + export
 - `src/export_zip.py` — ZIP creation
+- `src/olmocr_extract.py` — olmOCR server client (cho PDF font lỗi)
+- `src/upload_qdrant.py` — Optional: upload Qdrant
+- `src/check_env.py` — Kiểm tra môi trường
 - `main.py` — Thin shim (import src.cli)
 
 ## Môi trường
