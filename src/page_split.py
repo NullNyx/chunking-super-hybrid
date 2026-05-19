@@ -206,15 +206,26 @@ def parse_toc_from_text(text: str) -> List[TocEntry]:
     return entries
 
 
-def extract_pages_text(pdf_path: Union[str, Path]) -> Dict[int, str]:
+def extract_pages_text(pdf_path: Union[str, Path], *, use_olmocr: bool = False) -> Dict[int, str]:
     """
     Extract text from each page using pypdfium2.
+    If use_olmocr=True, delegates to olmOCR server instead.
+
+    Args:
+        pdf_path: Path to the PDF file
+        use_olmocr: Use olmOCR server for extraction (for PDFs with garbled fonts)
+
     Returns: {page_num (1-indexed): text}
     """
     pdf_path = Path(pdf_path)
+
+    if use_olmocr:
+        _safe_print(f"[olmOCR] Using olmOCR server for {pdf_path.name}...")
+        return _extract_pages_via_olmocr(pdf_path)
+
+    # Normal extraction via pypdfium2
     pdf = pdfium.PdfDocument(str(pdf_path))
     pages: Dict[int, str] = {}
-
     for i in range(len(pdf)):
         page = pdf[i]
         textpage = page.get_textpage()
@@ -222,8 +233,39 @@ def extract_pages_text(pdf_path: Union[str, Path]) -> Dict[int, str]:
         pages[i + 1] = text  # 1-indexed
         textpage.close()
         page.close()
-
     pdf.close()
+    return pages
+
+
+def _extract_pages_via_olmocr(pdf_path: Path) -> Dict[int, str]:
+    """
+    Extract all pages via olmOCR server.
+    Returns: {page_num (1-indexed): text}
+    """
+    from src.olmocr_extract import extract_pdf_via_olmocr
+
+    markdown = extract_pdf_via_olmocr(pdf_path)
+    if not markdown:
+        _safe_print(f"[olmOCR] Failed to extract {pdf_path.name}, falling back to pypdfium2")
+        pdf = pdfium.PdfDocument(str(pdf_path))
+        pages: Dict[int, str] = {}
+        for i in range(len(pdf)):
+            page = pdf[i]
+            textpage = page.get_textpage()
+            pages[i + 1] = textpage.get_text_bounded()
+            textpage.close()
+            page.close()
+        pdf.close()
+        return pages
+
+    # olmOCR returns continuous markdown — store as single entry
+    pdf = pdfium.PdfDocument(str(pdf_path))
+    total_pages = len(pdf)
+    pdf.close()
+
+    pages = {1: markdown}
+    for i in range(2, total_pages + 1):
+        pages[i] = ""
     return pages
 
 
@@ -302,15 +344,25 @@ def split_pdf_to_lessons(
     *,
     offset: int = 0,
     verbose: bool = True,
+    use_olmocr: bool = False,
 ) -> Dict[int, Path]:
     """
     Split PDF into per-lesson .txt files using TOC page boundaries.
 
+    When use_olmocr=True, sends per-lesson page ranges to the olmOCR server
+    for high-quality Vietnamese OCR extraction (for PDFs with garbled fonts).
+
     Returns: {lesson_num: output_path}
     """
+    pdf_path = Path(pdf_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    if use_olmocr:
+        return _split_pdf_to_lessons_olmocr(pdf_path, toc_text, output_dir,
+                                            offset=offset, verbose=verbose)
+
+    # Normal path: pypdfium2 extraction
     lessons = split_by_toc_pages(pdf_path, toc_text, offset=offset)
 
     output_paths: Dict[int, Path] = {}
@@ -331,6 +383,105 @@ def split_pdf_to_lessons(
         _safe_print(f"\n  Total: {len(output_paths)} lessons written to {output_dir}")
 
     return output_paths
+
+
+def _split_pdf_to_lessons_olmocr(
+    pdf_path: Path,
+    toc_text: str,
+    output_dir: Path,
+    *,
+    offset: int = 0,
+    verbose: bool = True,
+) -> Dict[int, Path]:
+    """
+    Split PDF into per-lesson .txt files using olmOCR for text extraction.
+    Sends each lesson's page range to the olmOCR server individually.
+    """
+    from src.olmocr_extract import extract_pages_via_olmocr
+
+    _safe_print(f"[olmOCR] Using olmOCR server for {pdf_path.name}...")
+
+    toc = parse_toc_from_text(toc_text)
+    if not toc:
+        _safe_print("[olmOCR] No TOC entries found, cannot split.")
+        return {}
+
+    toc = sorted(toc, key=lambda e: e.start_page)
+
+    pdf = pdfium.PdfDocument(str(pdf_path))
+    total_pages = len(pdf)
+    pdf.close()
+
+    output_paths: Dict[int, Path] = {}
+
+    for i, entry in enumerate(toc):
+        lesson_num = entry.lesson_num
+        title = entry.title
+        start = entry.start_page + offset - 1  # 0-indexed
+
+        if i + 1 < len(toc):
+            end = toc[i + 1].start_page + offset - 2
+        else:
+            end = total_pages - 1
+
+        if start < 0 or start >= total_pages:
+            continue
+        end = min(end, total_pages - 1)
+
+        if verbose:
+            _safe_print(f"  [olmOCR] Lesson {lesson_num}: '{title}' (pages {start+1}-{end+1})...")
+
+        markdown = extract_pages_via_olmocr(pdf_path, start, end)
+
+        if not markdown:
+            _safe_print(f"  ❌ Lesson {lesson_num} failed, skipping")
+            continue
+
+        # Convert markdown to plain text for CMS compatibility
+        content = _markdown_to_plain_text(markdown)
+
+        # Format output
+        out_text = f"##Title: Bài {lesson_num}. {title}\n\n{content}\n"
+        out_path = output_dir / f"lesson{lesson_num}.txt"
+        out_path.write_bytes(out_text.replace("\n", "\r\n").encode("utf-8"))
+        output_paths[lesson_num] = out_path
+
+        if verbose:
+            _safe_print(f"  ✅ lesson{lesson_num}.txt ({len(content)} chars)")
+
+    if verbose:
+        _safe_print(f"\n  Total: {len(output_paths)} lessons written to {output_dir}")
+
+    return output_paths
+
+
+def _markdown_to_plain_text(md_text: str) -> str:
+    """
+    Convert olmOCR markdown output to plain text suitable for CMS.
+    Keeps text content, converts tables to pipe format, removes images.
+    """
+    import re
+
+    lines = md_text.split('\n')
+    result = []
+
+    for line in lines:
+        # Remove image references
+        if line.strip().startswith('!['):
+            continue
+        # Remove markdown heading markers but keep text
+        if line.startswith('#'):
+            line = re.sub(r'^#+\s*', '', line)
+        # Keep LaTeX formulas as-is (they'll be in \(...\) or \[...\] format)
+        # Remove HTML table tags but this is complex; keep as-is for now
+        result.append(line)
+
+    text = '\n'.join(result)
+
+    # Clean up excessive blank lines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+
+    return text.strip()
 
 
 if __name__ == "__main__":
