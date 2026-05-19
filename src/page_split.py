@@ -167,9 +167,11 @@ def parse_toc_from_text(text: str) -> List[TocEntry]:
         return entries
 
     # Fallback: plain text format (lớp 6+)
-    # Pattern: "Bài X. Title" on one line, page number on next line
+    # Pattern: "Bài X. Title" on one line, page number on next line(s)
     lines = text.splitlines()
     TOC_PLAIN_RE = re.compile(r"^\s*Bài\s+(\d+)\.\s*(.+?)\s*$")
+    # Variant: title ends with page number on same line (e.g. "Bài 19. Hình chữ nhật. Hình thoi. 83")
+    TOC_PLAIN_INLINE_RE = re.compile(r"^\s*Bài\s+(\d+)\.\s*(.+?)\s+(\d+)\s*$")
 
     for i, line in enumerate(lines):
         m = TOC_PLAIN_RE.match(line)
@@ -177,13 +179,21 @@ def parse_toc_from_text(text: str) -> List[TocEntry]:
             lesson_num = int(m.group(1))
             title = m.group(2).strip()
 
-            # Look for page number on next line(s)
+            # Look for page number on next line(s), searching further for multi-line titles
             page_num = 0
-            for j in range(i + 1, min(i + 3, len(lines))):
+            for j in range(i + 1, min(i + 6, len(lines))):
                 next_line = lines[j].strip()
                 if next_line and re.match(r"^\d+$", next_line):
                     page_num = int(next_line)
                     break
+
+            # If no standalone page number found, check if title ends with a number
+            # (e.g. "Bài 19. Hình chữ nhật. Hình thoi. 83")
+            if page_num == 0:
+                m_inline = TOC_PLAIN_INLINE_RE.match(line)
+                if m_inline:
+                    page_num = int(m_inline.group(3))
+                    title = m_inline.group(2).strip()
 
             # Only add if we found a page number (confirms this is TOC, not body text)
             if page_num > 0:
@@ -252,6 +262,10 @@ def split_by_toc_pages(
         # We'll auto-detect by checking if the first lesson's title appears
         # near the expected page.
         pass  # Default offset=0 works for most cases
+
+    # Sort TOC entries by start_page to ensure correct page ranges
+    # (TOC text may list lessons out of page order, e.g. grouped by chapter)
+    toc = sorted(toc, key=lambda e: e.start_page)
 
     # Build page ranges for each lesson
     # lesson_ranges: [(lesson_num, title, start_page, end_page)]
