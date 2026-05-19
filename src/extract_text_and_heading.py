@@ -831,14 +831,33 @@ def inject_headings(
                             break
 
                     if matched_idx >= 0:
-                        # Pop all skipped titles (they weren't found)
+                        # Pop all skipped titles — inject them distributed
+                        # between last heading position and current position
+                        skipped_titles: List[Tuple[int, str]] = []
                         for _ in range(matched_idx):
-                            skipped_lesson, skipped_title = title_queue.popleft()
-                            # Still inject heading for skipped lessons at current position
-                            out_lines.append(f"## Heading: Bài {skipped_lesson}. {skipped_title}")
-                            count += 1
+                            skipped_titles.append(title_queue.popleft())
 
-                        # Inject the matched title (always, regardless of previous line)
+                        if skipped_titles:
+                            # Find the last heading position in out_lines
+                            last_heading_pos = 0
+                            for oi in range(len(out_lines) - 1, -1, -1):
+                                if out_lines[oi].strip().startswith("## Heading:"):
+                                    last_heading_pos = oi
+                                    break
+
+                            # Distribute skipped headings evenly between last heading and current position
+                            current_pos = len(out_lines)
+                            gap = current_pos - last_heading_pos
+                            step = gap // (len(skipped_titles) + 1) if gap > len(skipped_titles) else 1
+
+                            # Insert in reverse to preserve indices
+                            for si, (sk_lesson, sk_title) in enumerate(reversed(skipped_titles)):
+                                insert_pos = last_heading_pos + step * (len(skipped_titles) - si)
+                                insert_pos = min(insert_pos, current_pos)
+                                out_lines.insert(insert_pos, f"## Heading: Bài {sk_lesson}. {sk_title}")
+                                count += 1
+
+                        # Inject the matched title
                         next_lesson, next_title = title_queue.popleft()
                         out_lines.append(f"## Heading: Bài {next_lesson}. {next_title}")
                         count += 1

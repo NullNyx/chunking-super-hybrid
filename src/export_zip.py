@@ -115,33 +115,51 @@ def _build_zip_path(subject: str, grade: int, types: str, lesson: int) -> str:
 
 
 def export_to_zip(
-    json_root: str,
+    source_root: str,
     output_zip: str,
     *,
     verbose: bool = True,
 ) -> Dict[str, int]:
     """
-    Read chunked JSON from json_root, group by lesson, export to ZIP.
+    Create ZIP from a folder of .txt files, preserving relative paths.
 
     Args:
-        json_root: path to 03_chunked_raw or 04_merged_all
+        source_root: folder containing lesson .txt files (with subdirectory structure)
         output_zip: path to output .zip file
 
     Returns:
         stats dict with counts
     """
-    json_root_p = Path(json_root).resolve()
+    source_root_p = Path(source_root).resolve()
     output_zip_p = Path(output_zip).resolve()
     output_zip_p.parent.mkdir(parents=True, exist_ok=True)
 
-    if not json_root_p.exists():
-        raise FileNotFoundError(f"JSON root not found: {json_root_p}")
+    if not source_root_p.exists():
+        raise FileNotFoundError(f"Source root not found: {source_root_p}")
 
-    lesson_map = _build_lesson_map(json_root_p)
-
-    if not lesson_map:
-        print(f"[WARN] No lessons found in: {json_root_p}")
+    txt_files = sorted(source_root_p.rglob("*.txt"))
+    if not txt_files:
+        print(f"[WARN] No .txt files found in: {source_root_p}")
         return {"lessons": 0, "chunks": 0}
+
+    stats = {"lessons": 0, "chunks": 0}
+
+    with zipfile.ZipFile(output_zip_p, "w", zipfile.ZIP_DEFLATED) as zf:
+        for txt_path in txt_files:
+            rel_path = txt_path.relative_to(source_root_p)
+            content = txt_path.read_bytes()
+            zf.writestr(str(rel_path).replace("\\", "/"), content)
+            stats["lessons"] += 1
+
+    if verbose:
+        size_mb = output_zip_p.stat().st_size / (1024 * 1024)
+        print(f"  ZIP: {stats['lessons']} files, {size_mb:.2f} MB", end="")
+        if size_mb > 2.0:
+            print(f" [WARN]  Exceeds 2MB limit!")
+        else:
+            print(f" [OK] Within 2MB limit.")
+
+    return stats
 
     stats = {"lessons": 0, "chunks": 0}
 
@@ -163,9 +181,9 @@ def export_to_zip(
         size_mb = output_zip_p.stat().st_size / (1024 * 1024)
         print(f"ZIP size: {size_mb:.2f} MB", end="")
         if size_mb > 2.0:
-            print(f" ⚠️  Exceeds 2MB limit! Consider splitting by subject.")
+            print(f" [WARN]  Exceeds 2MB limit! Consider splitting by subject.")
         else:
-            print(f" ✓ Within 2MB limit.")
+            print(f" [OK] Within 2MB limit.")
 
     return stats
 

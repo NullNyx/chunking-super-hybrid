@@ -494,18 +494,45 @@ def main() -> None:
     print("DONE. Outputs:")
     print(json.dumps(paths, ensure_ascii=False, indent=2))
 
-    # 5) Export to ZIP (for "Import Lessons từ ZIP")
-    from src.export_zip import export_to_zip, export_to_folder
-
-    json_source = paths["json_chunked_root"]
-    export_root = str(out_root / "05_export")
+    # 5) Export to lesson .txt files using page-based splitting (precise boundaries)
+    from src.page_split import split_pdf_to_lessons
+    from src.export_zip import export_to_zip
 
     print("\n" + "=" * 60)
-    print("B5: Export to ZIP format")
+    print("B5: Page-based lesson splitting + ZIP export")
     print("=" * 60)
 
-    export_to_folder(json_source, str(Path(export_root) / "txt"))
-    export_to_zip(json_source, str(Path(export_root) / f"{subject}.zip"))
+    # Find all PDFs and their corresponding raw_text (for TOC parsing)
+    import re as _re
+    export_txt_root = out_root / "05_export" / "txt"
+    pdf_files = list(Path(input_root).rglob("*.pdf"))
+
+    for pdf_path in sorted(pdf_files):
+        # Determine grade from filename (e.g. Toan_3_Tap_1 → grade 3)
+        grade_match = _re.search(r"[_\s](\d{1,2})[_\s]", pdf_path.stem)
+        grade = int(grade_match.group(1)) if grade_match else 0
+
+        # Find raw_text for TOC (from work_tmp)
+        rel = pdf_path.relative_to(Path(input_root))
+        work_dir = out_root / "_work_tmp" / rel.with_suffix("")
+        raw_text_path = work_dir / "raw_text.txt"
+
+        if not raw_text_path.exists():
+            print(f"  [SKIP] No raw_text for {pdf_path.name}")
+            continue
+
+        toc_text = raw_text_path.read_text(encoding="utf-8", errors="ignore")
+
+        # Output: subject/Lop{grade}/LT/lesson{N}.txt
+        lesson_dir = export_txt_root / subject / f"Lop{grade}" / "LT"
+
+        print(f"\n  {pdf_path.name} -> {lesson_dir}")
+        split_pdf_to_lessons(pdf_path, toc_text, lesson_dir)
+
+    # Create ZIP from the export folder
+    zip_path = str(out_root / "05_export" / f"{subject}.zip")
+    print(f"\n  Creating ZIP: {zip_path}")
+    export_to_zip(str(export_txt_root), zip_path)
 
 
 if __name__ == "__main__":
