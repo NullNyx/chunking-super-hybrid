@@ -508,9 +508,16 @@ def main() -> None:
     pdf_files = list(Path(input_root).rglob("*.pdf"))
 
     for pdf_path in sorted(pdf_files):
-        # Determine grade from filename (e.g. Toan_3_Tap_1 → grade 3)
+        # Determine grade + volume from filename
+        # e.g. Toan_3_Tap_1 → grade=3, volume=1 → "Lop3_1"
+        # e.g. Toan_3 (no Tap) → grade=3, volume=None → "Lop3"
         grade_match = _re.search(r"[_\s](\d{1,2})[_\s]", pdf_path.stem)
         grade = int(grade_match.group(1)) if grade_match else 0
+
+        volume_match = _re.search(r"[Tt](?:ap|ập)[_\s]*(\d+)", pdf_path.stem)
+        volume = int(volume_match.group(1)) if volume_match else None
+
+        lop_folder = f"Lop{grade}_{volume}" if volume else f"Lop{grade}"
 
         # Find raw_text for TOC (from work_tmp)
         rel = pdf_path.relative_to(Path(input_root))
@@ -523,8 +530,8 @@ def main() -> None:
 
         toc_text = raw_text_path.read_text(encoding="utf-8", errors="ignore")
 
-        # Output: subject/Lop{grade}/LT/lesson{N}.txt
-        lesson_dir = export_txt_root / subject / f"Lop{grade}" / "LT"
+        # Output: subject/Lop{grade}_{volume}/LT/lesson{N}.txt
+        lesson_dir = export_txt_root / subject / lop_folder / "LT"
 
         print(f"\n  {pdf_path.name} -> {lesson_dir}")
         split_pdf_to_lessons(pdf_path, toc_text, lesson_dir)
