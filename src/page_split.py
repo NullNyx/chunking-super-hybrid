@@ -266,9 +266,8 @@ def split_pdf_to_lessons(
     for lesson_num, (title, content) in sorted(lessons.items()):
         # Clean layout artifacts before formatting output
         content = clean_lesson_text(content, title, lesson_num=lesson_num)
-        # Format: plain text, no markdown markers
-        # Start with "Bài X\nTITLE\n\n" then content
-        out_text = f"Bài {lesson_num}\n{title.upper()}\n\n{content}\n"
+        # Format: CMS-compatible with ##Title header
+        out_text = f"##Title: Bài {lesson_num}. {title}\n\n{content}\n"
         out_path = output_dir / f"lesson{lesson_num}.txt"
         # Write with CRLF line endings (Windows/CMS standard)
         out_path.write_bytes(out_text.replace("\n", "\r\n").encode("utf-8"))
