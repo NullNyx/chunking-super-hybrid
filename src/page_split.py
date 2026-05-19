@@ -142,20 +142,57 @@ class TocEntry:
 def parse_toc_from_text(text: str) -> List[TocEntry]:
     """
     Parse table of contents from Docling-extracted text.
-    Expects lines like: |  | Bài 1. Ôn tập các số đến 1 000  |  6 |
+
+    Supports two formats:
+    1. Table format (lớp 3-5): |  | Bài 1. Ôn tập các số đến 1 000  |  6 |
+    2. Plain text format (lớp 6+): "Bài 1. Tập hợp" followed by page number on next line
     """
-    TOC_RE = re.compile(
-        r"\|\s*\|\s*Bài\s+(\d+)\.\s*(.+?)\s*\|\s*(\d+)\s*\|"
+    # Try table format first
+    # Format A (lớp 3-5): |  | Bài 1. Ôn tập các số đến 1 000  |  6 |
+    # Format B (lớp 7-9): | Bài 1. Tập hợp các số hữu tỉ  |  5 |
+    TOC_TABLE_RE = re.compile(
+        r"\|\s*Bài\s+(\d+)\.\s*(.+?)\s*\|\s*(\d+)\s*\|"
     )
     entries: List[TocEntry] = []
     for line in text.splitlines():
-        m = TOC_RE.search(line)
+        m = TOC_TABLE_RE.search(line)
         if m:
             entries.append(TocEntry(
                 lesson_num=int(m.group(1)),
                 title=m.group(2).strip(),
                 start_page=int(m.group(3)),
             ))
+
+    if entries:
+        return entries
+
+    # Fallback: plain text format (lớp 6+)
+    # Pattern: "Bài X. Title" on one line, page number on next line
+    lines = text.splitlines()
+    TOC_PLAIN_RE = re.compile(r"^\s*Bài\s+(\d+)\.\s*(.+?)\s*$")
+
+    for i, line in enumerate(lines):
+        m = TOC_PLAIN_RE.match(line)
+        if m:
+            lesson_num = int(m.group(1))
+            title = m.group(2).strip()
+
+            # Look for page number on next line(s)
+            page_num = 0
+            for j in range(i + 1, min(i + 3, len(lines))):
+                next_line = lines[j].strip()
+                if next_line and re.match(r"^\d+$", next_line):
+                    page_num = int(next_line)
+                    break
+
+            # Only add if we found a page number (confirms this is TOC, not body text)
+            if page_num > 0:
+                entries.append(TocEntry(
+                    lesson_num=lesson_num,
+                    title=title,
+                    start_page=page_num,
+                ))
+
     return entries
 
 
