@@ -1,5 +1,7 @@
 ﻿# Repository Guidelines
 
+This repository uses Harness v0 for human-agent collaboration.
+
 ## Project Structure & Module Organization
 
 ```
@@ -12,8 +14,22 @@ chunking_super_hybrid/
 ├── outputs/                    # Pipeline output per step (01_extract_txt_raw → 05_export)
 ├── logs/                       # Per-run structured logs
 ├── main.py                     # Root shim (imports src.cli)
-└── pyproject.toml              # Project config, dependencies, scripts
+├── pyproject.toml              # Project config, dependencies, scripts
+├── docs/                       # Harness docs + product contract
+└── scripts/                    # Harness automation
 ```
+
+## Source of Truth
+
+Read in this order:
+
+1. `README.md` for project status.
+2. `docs/HARNESS.md` for the human-agent operating model.
+3. `docs/FEATURE_INTAKE.md` before turning any prompt into work.
+4. `docs/ARCHITECTURE.md` for pipeline architecture rules.
+5. `docs/stories/` for story packets and backlog.
+6. `docs/TEST_MATRIX.md` for proof status.
+7. `docs/decisions/` for why important choices were made.
 
 ## Build, Test, and Development Commands
 
@@ -58,3 +74,48 @@ Pipeline processes Vietnamese textbook PDFs through five stages:
 5. **B5** — TOC-based page splitting and ZIP export for CMS import.
 
 Output directories follow step numbering: `outputs/<subject>/01_extract_txt_raw/` through `05_export/`.
+
+## Task Loop
+
+For every task:
+
+1. Classify the request with `docs/FEATURE_INTAKE.md`.
+2. Identify whether the input is a new spec, spec slice, change request, new initiative, maintenance request, or harness improvement.
+3. Locate the affected product docs and story files.
+4. Check `docs/TEST_MATRIX.md` for existing proof and gaps.
+5. Work only inside the selected lane: tiny, normal, or high-risk.
+6. Before finishing, ask:
+   - Did product truth change?
+   - Did validation expectations change?
+   - Did architecture rules change?
+   - Did we discover a repeated failure pattern?
+   - Did the next agent need a clearer instruction?
+7. Update routine harness files directly, or add a proposal to `docs/HARNESS_BACKLOG.md` when the change is structural.
+
+## Harness Change Policy
+
+Agents may update directly:
+
+- Story status and evidence.
+- `docs/TEST_MATRIX.md` rows.
+- Links from story packets to product docs.
+- Validation notes and reports.
+- Small clarifications tied to the current task.
+
+Agents should ask for human confirmation before:
+
+- Changing architecture direction.
+- Removing validation requirements.
+- Changing the source-of-truth hierarchy.
+- Changing risk classification rules.
+- Replacing the feature workflow.
+
+## Done Definition
+
+A task is done only when:
+
+- The requested change is completed or the blocker is documented.
+- Relevant docs, stories, and test matrix entries remain current.
+- Validation commands were run when they exist.
+- Missing harness capabilities were added to `docs/HARNESS_BACKLOG.md`.
+- The final response says what changed and what was not attempted.
