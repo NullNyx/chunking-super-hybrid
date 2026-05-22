@@ -345,12 +345,18 @@ def split_pdf_to_lessons(
     offset: int = 0,
     verbose: bool = True,
     use_olmocr: bool = False,
+    olmocr_max_workers: int = 5,
+    pipeline_logger=None,
 ) -> Dict[int, Path]:
     """
     Split PDF into per-lesson .txt files using TOC page boundaries.
 
     When use_olmocr=True, sends per-lesson page ranges to the olmOCR server
     for high-quality Vietnamese OCR extraction (for PDFs with garbled fonts).
+
+    Args:
+        olmocr_max_workers: Number of parallel olmOCR requests (default 4).
+        pipeline_logger: Optional PipelineLogger instance for structured logging.
 
     Returns: {lesson_num: output_path}
     """
@@ -360,7 +366,9 @@ def split_pdf_to_lessons(
 
     if use_olmocr:
         return _split_pdf_to_lessons_olmocr(pdf_path, toc_text, output_dir,
-                                            offset=offset, verbose=verbose)
+                                            offset=offset, verbose=verbose,
+                                            max_workers=olmocr_max_workers,
+                                            pipeline_logger=pipeline_logger)
 
     # Normal path: pypdfium2 extraction
     lessons = split_by_toc_pages(pdf_path, toc_text, offset=offset)
@@ -378,6 +386,8 @@ def split_pdf_to_lessons(
 
         if verbose:
             _safe_print(f"  lesson{lesson_num}.txt: '{title}' ({len(content)} chars)")
+        if pipeline_logger:
+            pipeline_logger.lesson_ok(pdf_path.name, lesson_num, title)
 
     if verbose:
         _safe_print(f"\n  Total: {len(output_paths)} lessons written to {output_dir}")
@@ -392,18 +402,31 @@ def _split_pdf_to_lessons_olmocr(
     *,
     offset: int = 0,
     verbose: bool = True,
+    max_workers: int = 5,
+    pipeline_logger=None,
 ) -> Dict[int, Path]:
     """
     Split PDF into per-lesson .txt files using olmOCR for text extraction.
-    Sends each lesson's page range to the olmOCR server individually.
+    Sends each lesson's page range to the olmOCR server in PARALLEL
+    using ThreadPoolExecutor (I/O-bound → threads are ideal).
+
+    Args:
+        max_workers: Number of concurrent olmOCR requests (default 5).
+                     Increase if server can handle more; decrease if rate-limited.
+        pipeline_logger: Optional PipelineLogger for structured logging.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     from src.olmocr_extract import extract_pages_via_olmocr
 
-    _safe_print(f"[olmOCR] Using olmOCR server for {pdf_path.name}...")
+    _safe_print(f"[olmOCR] Using olmOCR server for {pdf_path.name} (parallel={max_workers})...")
+    if pipeline_logger:
+        pipeline_logger.info(f"[olmOCR] {pdf_path.name}: parallel={max_workers}")
 
     toc = parse_toc_from_text(toc_text)
     if not toc:
         _safe_print("[olmOCR] No TOC entries found, cannot split.")
+        if pipeline_logger:
+            pipeline_logger.warning(f"[olmOCR] {pdf_path.name}: No TOC entries found")
         return {}
 
     toc = sorted(toc, key=lambda e: e.start_page)
@@ -412,8 +435,8 @@ def _split_pdf_to_lessons_olmocr(
     total_pages = len(pdf)
     pdf.close()
 
-    output_paths: Dict[int, Path] = {}
-
+    # Build list of (lesson_num, title, start_page_0idx, end_page_0idx)
+    tasks: List[Tuple[int, str, int, int]] = []
     for i, entry in enumerate(toc):
         lesson_num = entry.lesson_num
         title = entry.title
@@ -427,30 +450,76 @@ def _split_pdf_to_lessons_olmocr(
         if start < 0 or start >= total_pages:
             continue
         end = min(end, total_pages - 1)
-
-        if verbose:
-            _safe_print(f"  [olmOCR] Lesson {lesson_num}: '{title}' (pages {start+1}-{end+1})...")
-
-        markdown = extract_pages_via_olmocr(pdf_path, start, end)
-
-        if not markdown:
-            _safe_print(f"  ❌ Lesson {lesson_num} failed, skipping")
-            continue
-
-        # Convert markdown to plain text for CMS compatibility
-        content = _markdown_to_plain_text(markdown)
-
-        # Format output
-        out_text = f"##Title: Bài {lesson_num}. {title}\n\n{content}\n"
-        out_path = output_dir / f"lesson{lesson_num}.txt"
-        out_path.write_bytes(out_text.replace("\n", "\r\n").encode("utf-8"))
-        output_paths[lesson_num] = out_path
-
-        if verbose:
-            _safe_print(f"  ✅ lesson{lesson_num}.txt ({len(content)} chars)")
+        tasks.append((lesson_num, title, start, end))
 
     if verbose:
-        _safe_print(f"\n  Total: {len(output_paths)} lessons written to {output_dir}")
+        _safe_print(f"  {len(tasks)} lessons to OCR, dispatching {max_workers} parallel requests...")
+    if pipeline_logger:
+        pipeline_logger.info(f"  {pdf_path.name}: {len(tasks)} lessons to OCR")
+
+    output_paths: Dict[int, Path] = {}
+    failed_lessons: List[Tuple[int, str]] = []
+
+    def _ocr_one_lesson(lesson_num: int, title: str, start: int, end: int):
+        """Worker: OCR one lesson's page range."""
+        if verbose:
+            _safe_print(f"  [olmOCR] Lesson {lesson_num}: '{title}' (pages {start+1}-{end+1})...")
+        markdown, err = extract_pages_via_olmocr(pdf_path, start, end, return_error=True)
+        return lesson_num, title, start, end, markdown, err
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_ocr_one_lesson, ln, t, s, e): (ln, t)
+            for ln, t, s, e in tasks
+        }
+
+        for future in as_completed(futures):
+            ln_key, title_key = futures[future]
+            try:
+                lesson_num, title, start, end, markdown, err = future.result()
+            except Exception as exc:
+                _safe_print(f"  ❌ Lesson {ln_key} exception: {exc}")
+                failed_lessons.append((ln_key, title_key))
+                if pipeline_logger:
+                    pipeline_logger.lesson_failed(
+                        pdf_path.name, ln_key, str(exc), title=title_key
+                    )
+                continue
+
+            if not markdown:
+                error_detail = err or "olmOCR returned empty response"
+                _safe_print(f"  ❌ Lesson {lesson_num} failed: {error_detail}")
+                failed_lessons.append((lesson_num, title))
+                if pipeline_logger:
+                    pipeline_logger.lesson_failed(
+                        pdf_path.name, lesson_num,
+                        f"pages {start+1}-{end+1}: {error_detail}",
+                        title=title,
+                    )
+                continue
+
+            # Convert markdown to plain text for CMS compatibility
+            content = _markdown_to_plain_text(markdown)
+
+            # Format output
+            out_text = f"##Title: Bài {lesson_num}. {title}\n\n{content}\n"
+            out_path = output_dir / f"lesson{lesson_num}.txt"
+            out_path.write_bytes(out_text.replace("\n", "\r\n").encode("utf-8"))
+            output_paths[lesson_num] = out_path
+
+            if verbose:
+                _safe_print(f"  ✅ lesson{lesson_num}.txt ({len(content)} chars)")
+            if pipeline_logger:
+                pipeline_logger.lesson_ok(pdf_path.name, lesson_num, title)
+
+    if verbose:
+        _safe_print(f"\n  Total: {len(output_paths)} lessons OK, {len(failed_lessons)} failed")
+        if failed_lessons:
+            _safe_print(f"  Failed lessons: {sorted([ln for ln, _ in failed_lessons])}")
+    if pipeline_logger:
+        pipeline_logger.info(
+            f"  {pdf_path.name}: {len(output_paths)} OK, {len(failed_lessons)} failed"
+        )
 
     return output_paths
 

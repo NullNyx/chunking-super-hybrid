@@ -36,7 +36,7 @@ OLMOCR_API_URL = "https://olmocr.aibuddy.vn/ocr"
 # Request settings
 REQUEST_TIMEOUT = 600  # 10 minutes per request
 MAX_RETRIES = 3
-RETRY_DELAY = 5  # seconds between retries
+RETRY_DELAY = 5  # seconds between retries (fixed delay)
 
 
 def _safe_print(s: str) -> None:
@@ -116,7 +116,8 @@ def extract_pages_via_olmocr(
     *,
     api_url: str = OLMOCR_API_URL,
     timeout: int = REQUEST_TIMEOUT,
-) -> Optional[str]:
+    return_error: bool = False,
+) -> Union[Optional[str], tuple]:
     """
     Extract specific pages from a PDF via olmOCR.
 
@@ -129,9 +130,11 @@ def extract_pages_via_olmocr(
         end: End page (0-indexed, inclusive)
         api_url: olmOCR server URL
         timeout: Request timeout in seconds
+        return_error: If True, returns (markdown_or_None, error_msg_or_None)
 
     Returns:
-        Markdown text from OCR, or None if failed
+        If return_error=False: Markdown text from OCR, or None if failed
+        If return_error=True: (markdown_or_None, error_msg_or_None)
     """
     import fitz  # PyMuPDF
 
@@ -159,9 +162,12 @@ def extract_pages_via_olmocr(
 
             if response.status_code == 200:
                 data = response.json()
-                return data.get("markdown", "")
+                result = data.get("markdown", "")
+                return (result, None) if return_error else result
             else:
                 last_error = f"HTTP {response.status_code}"
+        except requests.exceptions.Timeout:
+            last_error = f"Timeout after {timeout}s"
         except Exception as e:
             last_error = f"{type(e).__name__}: {e}"
 
@@ -169,7 +175,7 @@ def extract_pages_via_olmocr(
             time.sleep(RETRY_DELAY)
 
     _safe_print(f"[olmOCR] Failed pages {start+1}-{end+1} of {pdf_path.name}: {last_error}")
-    return None
+    return (None, last_error) if return_error else None
 
 
 def split_pdf_to_lesson_pdfs_and_ocr(
@@ -179,9 +185,11 @@ def split_pdf_to_lesson_pdfs_and_ocr(
     offset: int = 0,
     api_url: str = OLMOCR_API_URL,
     verbose: bool = True,
+    max_workers: int = 5,
 ) -> dict:
     """
     Split PDF into per-lesson page ranges and OCR each via olmOCR.
+    Uses ThreadPoolExecutor for parallel requests (I/O-bound).
 
     Args:
         pdf_path: Path to the full PDF
@@ -189,19 +197,21 @@ def split_pdf_to_lesson_pdfs_and_ocr(
         offset: Page offset
         api_url: olmOCR server URL
         verbose: Print progress
+        max_workers: Number of concurrent olmOCR requests (default 5)
 
     Returns:
         {lesson_num: (title, markdown_text)}
     """
     import fitz
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     pdf_path = Path(pdf_path)
     doc = fitz.open(str(pdf_path))
     total_pages = doc.page_count
     doc.close()
 
-    # Build page ranges
-    results = {}
+    # Build tasks list
+    tasks = []
     for i, entry in enumerate(toc):
         lesson_num = entry["lesson_num"]
         title = entry["title"]
@@ -214,20 +224,41 @@ def split_pdf_to_lesson_pdfs_and_ocr(
 
         if start < 0 or start >= total_pages:
             continue
-
         end = min(end, total_pages - 1)
+        tasks.append((lesson_num, title, start, end))
 
+    if verbose:
+        _safe_print(f"[olmOCR] {len(tasks)} lessons, parallel={max_workers}")
+
+    results = {}
+
+    def _ocr_lesson(lesson_num, title, start, end):
         if verbose:
             _safe_print(f"[olmOCR] Lesson {lesson_num}: '{title}' (pages {start+1}-{end+1})...")
-
         markdown = extract_pages_via_olmocr(pdf_path, start, end, api_url=api_url)
+        return lesson_num, title, markdown
 
-        if markdown:
-            results[lesson_num] = (title, markdown)
-            if verbose:
-                _safe_print(f"  ✅ {len(markdown)} chars")
-        else:
-            if verbose:
-                _safe_print(f"  ❌ Failed")
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_ocr_lesson, ln, t, s, e): ln
+            for ln, t, s, e in tasks
+        }
+
+        for future in as_completed(futures):
+            try:
+                lesson_num, title, markdown = future.result()
+            except Exception as exc:
+                lesson_num = futures[future]
+                if verbose:
+                    _safe_print(f"  ❌ Lesson {lesson_num} exception: {exc}")
+                continue
+
+            if markdown:
+                results[lesson_num] = (title, markdown)
+                if verbose:
+                    _safe_print(f"  ✅ Lesson {lesson_num}: {len(markdown)} chars")
+            else:
+                if verbose:
+                    _safe_print(f"  ❌ Lesson {lesson_num} failed")
 
     return results

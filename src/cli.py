@@ -48,6 +48,7 @@ from src.extract_text_and_heading import run_one_pdf
 from src.convert_text_raw_to_json import convert_folder
 from src.merge_and_split_json import process_json_folder
 from src.post_process_json import merge_all_lessons_to_one_json
+from src.pipeline_logger import PipelineLogger
 
 
 # -------------------------
@@ -187,6 +188,7 @@ def pdfs_to_mirrored_txt(
     cleanup_work: bool = True,
     work_root: Optional[Union[str, Path]] = None,
     max_workers: int = 2,
+    pipeline_logger: Optional[PipelineLogger] = None,
 ) -> Dict[str, int]:
     """
     Speed-ups:
@@ -277,11 +279,17 @@ def pdfs_to_mirrored_txt(
             timings.append({"pdf": pdf, "seconds": float(secs), "status": status})
             if status == "ok":
                 stats["ok"] += 1
+                if pipeline_logger:
+                    pipeline_logger.pdf_ok(Path(pdf).name, elapsed=secs)
             elif status == "skipped":
                 stats["skipped"] += 1
+                if pipeline_logger:
+                    pipeline_logger.pdf_skipped(Path(pdf).name)
             else:
                 stats["failed"] += 1
                 failures.append({"pdf": pdf, "error": err or "unknown"})
+                if pipeline_logger:
+                    pipeline_logger.pdf_failed(Path(pdf).name, err or "unknown", elapsed=secs)
                 print("\n" + "=" * 120)
                 print(f"[FAILED] {pdf}")
                 print(err or "unknown")
@@ -322,11 +330,17 @@ def pdfs_to_mirrored_txt(
 
                 if status == "ok":
                     stats["ok"] += 1
+                    if pipeline_logger:
+                        pipeline_logger.pdf_ok(Path(pdf).name, elapsed=secs)
                 elif status == "skipped":
                     stats["skipped"] += 1
+                    if pipeline_logger:
+                        pipeline_logger.pdf_skipped(Path(pdf).name)
                 else:
                     stats["failed"] += 1
                     failures.append({"pdf": pdf, "error": err or "unknown"})
+                    if pipeline_logger:
+                        pipeline_logger.pdf_failed(Path(pdf).name, err or "unknown", elapsed=secs)
                     if status == "failed":
                         print("\n" + "=" * 120)
                         print(f"[FAILED] {pdf}")
@@ -386,6 +400,7 @@ def run_e2e_pdf_folder_to_chunked_json(
     chunk_version: str = "v1",
     merge_all: bool = True,
     merged_out_version: str = "v2",
+    pipeline_logger: Optional[PipelineLogger] = None,
 ) -> Dict[str, str]:
     out_root = Path(out_root).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
@@ -396,6 +411,8 @@ def run_e2e_pdf_folder_to_chunked_json(
     merged_root = out_root / "04_merged_all"
 
     # 1) PDFs -> mirrored TXT
+    if pipeline_logger:
+        pipeline_logger.step_start("B1", "PDFs -> TXT (Docling + CLIP heading)")
     pdfs_to_mirrored_txt(
         input_pdfs_root,
         output_txt_root=txt_root,
@@ -412,16 +429,25 @@ def run_e2e_pdf_folder_to_chunked_json(
         cleanup_work=cleanup_work,
         work_root=out_root / "_work_tmp",
         max_workers=pdf_max_workers,
+        pipeline_logger=pipeline_logger,
     )
+    if pipeline_logger:
+        pipeline_logger.step_end("B1")
 
     # 2) TXT -> JSON raw
+    if pipeline_logger:
+        pipeline_logger.step_start("B2", "TXT -> JSON raw (convert_folder)")
     convert_folder(
         input_root=str(txt_root),
         output_root=str(json_raw_root),
         chunk_version=chunk_version,
     )
+    if pipeline_logger:
+        pipeline_logger.step_end("B2")
 
     # 3) JSON raw -> JSON chunked *MAIN CHUNKING
+    if pipeline_logger:
+        pipeline_logger.step_start("B3", "JSON chunking + overlap")
     process_json_folder(
         input_root=str(json_raw_root),
         output_root=str(json_chunked_root),
@@ -431,10 +457,14 @@ def run_e2e_pdf_folder_to_chunked_json(
         overlap_units=overlap_units,
         chunk_version=chunk_version,
     )
+    if pipeline_logger:
+        pipeline_logger.step_end("B3")
 
     # 4) Merge all lessons
     merged_path = ""
     if merge_all:
+        if pipeline_logger:
+            pipeline_logger.step_start("B4", "Merge all lessons")
         merged_root.mkdir(parents=True, exist_ok=True)
         merge_all_lessons_to_one_json(
             input_root=str(json_chunked_root),
@@ -442,6 +472,8 @@ def run_e2e_pdf_folder_to_chunked_json(
             out_version=merged_out_version,
         )
         merged_path = str(merged_root)
+        if pipeline_logger:
+            pipeline_logger.step_end("B4")
 
     return {
         "txt_root": str(txt_root),
@@ -451,22 +483,120 @@ def run_e2e_pdf_folder_to_chunked_json(
     }
 
 
-def main() -> None:
-    """Console entry point used by `uv run chunk-pipeline`."""
-    import sys
-
-    # Input root: default ./input, or pass as first argument
-    input_root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(r".\input")
-
-    # Auto-detect subject from input subfolder(s)
-    # e.g. input/toan/ → subject = "toan", out_root = outputs/toan/
+def _detect_subject_and_out_root(input_root: Path) -> Tuple[str, Path]:
+    """Auto-detect subject from input subfolder(s) and return (subject, out_root)."""
     subdirs = [d for d in input_root.iterdir() if d.is_dir()]
     if len(subdirs) == 1:
         subject = subdirs[0].name
     else:
         subject = input_root.name
-
     out_root = Path(r".\outputs") / subject
+    return subject, out_root
+
+
+def _run_export_step(
+    input_root: Path,
+    out_root: Path,
+    subject: str,
+    *,
+    use_olmocr: bool = False,
+    pipeline_logger: Optional[PipelineLogger] = None,
+) -> None:
+    """
+    B5: Page-based lesson splitting + ZIP export.
+
+    Args:
+        use_olmocr: If True, use olmOCR server for text extraction
+                    (for PDFs with garbled fonts like Toán 9).
+        pipeline_logger: Optional logger for structured run logging.
+    """
+    from src.page_split import split_pdf_to_lessons
+    from src.export_zip import export_to_zip
+    import re as _re
+
+    print("\n" + "=" * 60)
+    print(f"B5: Page-based lesson splitting + ZIP export"
+          f"{' [olmOCR]' if use_olmocr else ''}")
+    print("=" * 60)
+
+    if pipeline_logger:
+        pipeline_logger.step_start("B5", f"Page-based lesson splitting{' [olmOCR]' if use_olmocr else ''}")
+
+    export_txt_root = out_root / "05_export" / "txt"
+    pdf_files = list(Path(input_root).rglob("*.pdf"))
+
+    for pdf_path in sorted(pdf_files):
+        # Determine grade + volume from filename
+        # e.g. Toan_3_Tap_1 → grade=3, volume=1 → "Lop3_1"
+        # e.g. Toan_3 (no Tap) → grade=3, volume=None → "Lop3"
+        grade_match = _re.search(r"[_\s](\d{1,2})[_\s]", pdf_path.stem)
+        grade = int(grade_match.group(1)) if grade_match else 0
+
+        volume_match = _re.search(r"[Tt](?:ap|ập)[_\s]*(\d+)", pdf_path.stem)
+        volume = int(volume_match.group(1)) if volume_match else None
+
+        lop_folder = f"Lop{grade}_{volume}" if volume else f"Lop{grade}"
+
+        # Find raw_text for TOC (from work_tmp)
+        rel = pdf_path.relative_to(Path(input_root))
+        work_dir = out_root / "_work_tmp" / rel.with_suffix("")
+        raw_text_path = work_dir / "raw_text.txt"
+
+        if not raw_text_path.exists():
+            print(f"  [SKIP] No raw_text for {pdf_path.name}")
+            if pipeline_logger:
+                pipeline_logger.lesson_skipped(pdf_path.name, "No raw_text.txt (TOC not available)")
+            continue
+
+        toc_text = raw_text_path.read_text(encoding="utf-8", errors="ignore")
+
+        # Output: subject/Lop{grade}_{volume}/LT/lesson{N}.txt
+        lesson_dir = export_txt_root / subject / lop_folder / "LT"
+
+        print(f"\n  {pdf_path.name} -> {lesson_dir}")
+
+        try:
+            result = split_pdf_to_lessons(pdf_path, toc_text, lesson_dir,
+                                          use_olmocr=use_olmocr,
+                                          pipeline_logger=pipeline_logger)
+            if pipeline_logger and not result:
+                pipeline_logger.lesson_skipped(pdf_path.name, "No lessons extracted from TOC")
+        except Exception as e:
+            err_msg = traceback.format_exc()
+            print(f"  [ERROR] {pdf_path.name}: {e}")
+            if pipeline_logger:
+                pipeline_logger.pdf_failed(pdf_path.name, err_msg)
+
+    # Create ZIP from the export folder
+    zip_path = str(out_root / "05_export" / f"{subject}.zip")
+    print(f"\n  Creating ZIP: {zip_path}")
+    try:
+        export_to_zip(str(export_txt_root), zip_path)
+    except Exception as e:
+        if pipeline_logger:
+            pipeline_logger.error(f"ZIP creation failed: {e}")
+
+    if pipeline_logger:
+        pipeline_logger.step_end("B5")
+
+
+def main() -> None:
+    """
+    Console entry point: `uv run chunk-pipeline`
+
+    Full pipeline (B1→B5): Docling extract + CLIP heading + chunking + page split.
+    Uses pypdfium2 for text extraction (works for PDFs with normal fonts).
+    """
+    import sys
+
+    # Input root: default ./input, or pass as first argument
+    input_root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(r".\input")
+    subject, out_root = _detect_subject_and_out_root(input_root)
+
+    # Initialize pipeline logger
+    plog = PipelineLogger(subject=subject)
+    plog.info(f"Input: {input_root}")
+    plog.info(f"Output: {out_root}")
 
     paths = run_e2e_pdf_folder_to_chunked_json(
         input_pdfs_root=str(input_root),
@@ -490,56 +620,65 @@ def main() -> None:
         chunk_version="v1",
         merge_all=True,
         merged_out_version="v1",
+        pipeline_logger=plog,
     )
-    print("DONE. Outputs:")
+    print("DONE (B1-B4). Outputs:")
     print(json.dumps(paths, ensure_ascii=False, indent=2))
+    plog.info("B1-B4 completed.")
 
-    # 5) Export to lesson .txt files using page-based splitting (precise boundaries)
-    from src.page_split import split_pdf_to_lessons
-    from src.export_zip import export_to_zip
+    # B5: Export using pypdfium2 (normal fonts)
+    _run_export_step(input_root, out_root, subject, use_olmocr=False, pipeline_logger=plog)
 
-    print("\n" + "=" * 60)
-    print("B5: Page-based lesson splitting + ZIP export")
+    # Finalize log
+    plog.finish()
+
+
+def main_ocr() -> None:
+    """
+    Console entry point: `uv run chunk-pipeline-ocr`
+
+    olmOCR pipeline (B5 only): Skips Docling extraction (B1-B4) and uses
+    olmOCR server for text extraction. Applies to ALL PDFs in the input folder
+    (not just garbled-font ones).
+
+    Requires:
+    - B1 already run (raw_text.txt exists for TOC parsing)
+    - olmOCR server running at https://olmocr.aibuddy.vn/ocr
+
+    Usage:
+        uv run chunk-pipeline-ocr [input_root]
+    """
+    import sys
+
+    input_root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(r".\input")
+    subject, out_root = _detect_subject_and_out_root(input_root)
+
+    # Verify raw_text exists (B1 must have been run before)
+    work_tmp = out_root / "_work_tmp"
+    if not work_tmp.exists():
+        print(f"ERROR: {work_tmp} not found.")
+        print("You must run `chunk-pipeline` first (at least B1) to generate raw_text.txt for TOC parsing.")
+        print("Then re-run this command to use olmOCR for text extraction.")
+        sys.exit(1)
+
+    # Initialize pipeline logger
+    plog = PipelineLogger(subject=f"{subject}_ocr")
+    plog.info(f"Input: {input_root}")
+    plog.info(f"Output: {out_root}")
+
     print("=" * 60)
+    print(f"olmOCR Pipeline — Subject: {subject}")
+    print(f"Input: {input_root}")
+    print(f"Output: {out_root}")
+    print("=" * 60)
+    print("\nSkipping B1-B4 (using existing raw_text for TOC).")
+    print("Using olmOCR server for ALL PDFs.\n")
 
-    # Find all PDFs and their corresponding raw_text (for TOC parsing)
-    import re as _re
-    export_txt_root = out_root / "05_export" / "txt"
-    pdf_files = list(Path(input_root).rglob("*.pdf"))
+    # B5: Export ALL PDFs using olmOCR
+    _run_export_step(input_root, out_root, subject, use_olmocr=True, pipeline_logger=plog)
 
-    for pdf_path in sorted(pdf_files):
-        # Determine grade + volume from filename
-        # e.g. Toan_3_Tap_1 → grade=3, volume=1 → "Lop3_1"
-        # e.g. Toan_3 (no Tap) → grade=3, volume=None → "Lop3"
-        grade_match = _re.search(r"[_\s](\d{1,2})[_\s]", pdf_path.stem)
-        grade = int(grade_match.group(1)) if grade_match else 0
-
-        volume_match = _re.search(r"[Tt](?:ap|ập)[_\s]*(\d+)", pdf_path.stem)
-        volume = int(volume_match.group(1)) if volume_match else None
-
-        lop_folder = f"Lop{grade}_{volume}" if volume else f"Lop{grade}"
-
-        # Find raw_text for TOC (from work_tmp)
-        rel = pdf_path.relative_to(Path(input_root))
-        work_dir = out_root / "_work_tmp" / rel.with_suffix("")
-        raw_text_path = work_dir / "raw_text.txt"
-
-        if not raw_text_path.exists():
-            print(f"  [SKIP] No raw_text for {pdf_path.name}")
-            continue
-
-        toc_text = raw_text_path.read_text(encoding="utf-8", errors="ignore")
-
-        # Output: subject/Lop{grade}_{volume}/LT/lesson{N}.txt
-        lesson_dir = export_txt_root / subject / lop_folder / "LT"
-
-        print(f"\n  {pdf_path.name} -> {lesson_dir}")
-        split_pdf_to_lessons(pdf_path, toc_text, lesson_dir)
-
-    # Create ZIP from the export folder
-    zip_path = str(out_root / "05_export" / f"{subject}.zip")
-    print(f"\n  Creating ZIP: {zip_path}")
-    export_to_zip(str(export_txt_root), zip_path)
+    # Finalize log
+    plog.finish()
 
 
 if __name__ == "__main__":
