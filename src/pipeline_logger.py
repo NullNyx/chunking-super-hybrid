@@ -1,19 +1,23 @@
 ﻿"""
-Pipeline run logger.
+Pipeline Logger / Ghi log pipeline với structured logging
 
-Má»—i láº§n cháº¡y pipeline táº¡o 1 file log riÃªng (theo timestamp) trong thÆ° má»¥c logs/.
-Tá»± Ä‘á»™ng lá»c error log vÃ  tá»•ng há»£p danh sÃ¡ch lesson bá»‹ failed.
+Input:
+- Pipeline stage events (step_start, step_end, lesson_ok, lesson_failed)
+
+Output:
+- Log files trong logs/ directory
+- Summary + error-only log
+
+Workflow:
+1. Tạo timestamped log file cho mỗi run
+2. Track per-lesson errors
+3. Auto-filter error logs, summarize failed lessons
 
 Usage:
-    from src.pipeline_logger import PipelineLogger
-
     logger = PipelineLogger(subject="toan")
-    logger.info("Starting pipeline...")
     logger.step_start("B1", "PDFs -> TXT")
-    logger.lesson_ok("Toan_3_Tap_1.pdf", lesson_num=5)
-    logger.lesson_failed("Toan_3_Tap_1.pdf", lesson_num=7, error="...")
     logger.step_end("B1")
-    logger.finish()  # writes summary + error-only log
+    logger.finish()
 """
 from __future__ import annotations
 
@@ -34,6 +38,13 @@ class PipelineLogger:
         log_dir: Optional[str] = None,
         level: int = logging.DEBUG,
     ) -> None:
+        """Initialize the pipeline logger.
+
+        Args:
+            subject: Subject name used for log file naming.
+            log_dir: Directory for log files. Defaults to "./logs".
+            level: Logging level. Defaults to DEBUG.
+        """
         self.subject = subject
         self.start_time = time.time()
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -42,20 +53,18 @@ class PipelineLogger:
         self.log_dir = Path(log_dir) if log_dir else Path("./logs")
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
-        # Main log file (all levels)
-        self.log_file = self.log_dir / f"run_{subject}_{self.timestamp}.log"
-        # Error-only log file (filtered)
-        self.error_log_file = self.log_dir / f"run_{subject}_{self.timestamp}_ERRORS.log"
-        # JSON summary
-        self.summary_file = self.log_dir / f"run_{subject}_{self.timestamp}_summary.json"
+        # Log files named by subject only — subsequent runs overwrite previous logs
+        self.log_file = self.log_dir / f"run_{subject}.log"
+        self.error_log_file = self.log_dir / f"run_{subject}_ERRORS.log"
+        self.summary_file = self.log_dir / f"run_{subject}_summary.json"
 
         # Setup Python logger
         self._logger = logging.getLogger(f"pipeline.{subject}.{self.timestamp}")
         self._logger.setLevel(level)
         self._logger.propagate = False
 
-        # File handler: all logs
-        fh = logging.FileHandler(str(self.log_file), encoding="utf-8")
+        # File handler: all logs (mode='w' to overwrite previous run)
+        fh = logging.FileHandler(str(self.log_file), mode="w", encoding="utf-8")
         fh.setLevel(level)
         fh.setFormatter(logging.Formatter(
             "%(asctime)s | %(levelname)-7s | %(message)s",
@@ -64,7 +73,7 @@ class PipelineLogger:
         self._logger.addHandler(fh)
 
         # Error file handler: ERROR+ only
-        efh = logging.FileHandler(str(self.error_log_file), encoding="utf-8")
+        efh = logging.FileHandler(str(self.error_log_file), mode="w", encoding="utf-8")
         efh.setLevel(logging.ERROR)
         efh.setFormatter(logging.Formatter(
             "%(asctime)s | %(levelname)-7s | %(message)s",
@@ -94,22 +103,31 @@ class PipelineLogger:
     # Basic logging
     # ------------------------------------------------------------------
     def debug(self, msg: str) -> None:
+        """Log debug message."""
         self._logger.debug(msg)
 
     def info(self, msg: str) -> None:
+        """Log info message."""
         self._logger.info(msg)
 
     def warning(self, msg: str) -> None:
+        """Log warning message."""
         self._logger.warning(msg)
 
     def error(self, msg: str) -> None:
+        """Log error message."""
         self._logger.error(msg)
 
     # ------------------------------------------------------------------
     # Step tracking (B1, B2, B3, B4, B5)
     # ------------------------------------------------------------------
     def step_start(self, step_id: str, description: str = "") -> None:
-        """Mark the beginning of a pipeline step."""
+        """Mark the beginning of a pipeline step.
+
+        Args:
+            step_id: Step identifier (e.g., "B1", "B2").
+            description: Human-readable description of the step.
+        """
         self._current_step = step_id
         self._step_start_time = time.time()
         self._step_stats[step_id] = {
@@ -125,7 +143,11 @@ class PipelineLogger:
         self._logger.info("-" * 60)
 
     def step_end(self, step_id: Optional[str] = None) -> None:
-        """Mark the end of a pipeline step."""
+        """Mark the end of a pipeline step.
+
+        Args:
+            step_id: Step identifier. Defaults to current step if not specified.
+        """
         step_id = step_id or self._current_step
         if step_id and step_id in self._step_stats:
             elapsed = time.time() - self._step_start_time
@@ -141,19 +163,34 @@ class PipelineLogger:
     # Per-PDF / per-lesson tracking
     # ------------------------------------------------------------------
     def pdf_ok(self, pdf_name: str, elapsed: float = 0.0) -> None:
-        """Log a successful PDF processing."""
+        """Log a successful PDF processing.
+
+        Args:
+            pdf_name: Name of the PDF file.
+            elapsed: Time taken to process in seconds.
+        """
         if self._current_step and self._current_step in self._step_stats:
             self._step_stats[self._current_step]["ok"] += 1
         self._logger.info(f"  [OK] {pdf_name} ({elapsed:.1f}s)")
 
     def pdf_skipped(self, pdf_name: str) -> None:
-        """Log a skipped PDF (already exists)."""
+        """Log a skipped PDF (already exists).
+
+        Args:
+            pdf_name: Name of the PDF file.
+        """
         if self._current_step and self._current_step in self._step_stats:
             self._step_stats[self._current_step]["skipped"] += 1
         self._logger.debug(f"  [SKIP] {pdf_name}")
 
     def pdf_failed(self, pdf_name: str, error: str, elapsed: float = 0.0) -> None:
-        """Log a failed PDF processing."""
+        """Log a failed PDF processing.
+
+        Args:
+            pdf_name: Name of the PDF file.
+            error: Error message.
+            elapsed: Time taken before failure in seconds.
+        """
         if self._current_step and self._current_step in self._step_stats:
             self._step_stats[self._current_step]["failed"] += 1
             self._step_stats[self._current_step]["failures"].append(pdf_name)
@@ -169,15 +206,34 @@ class PipelineLogger:
         self._logger.error(f"    Error: {error[:500]}")
 
     def lesson_ok(self, pdf_name: str, lesson_num: int, title: str = "") -> None:
-        """Log a successful lesson split."""
+        """Log a successful lesson split.
+
+        Args:
+            pdf_name: Name of the source PDF.
+            lesson_num: Lesson number.
+            title: Lesson title.
+        """
         if self._current_step and self._current_step in self._step_stats:
             self._step_stats[self._current_step]["ok"] += 1
         self._logger.info(f"  [OK] {pdf_name} / lesson{lesson_num}: {title}")
 
     def lesson_failed(
-        self, pdf_name: str, lesson_num: int, error: str, title: str = ""
+        self,
+        pdf_name: str,
+        lesson_num: int,
+        error: str,
+        title: str = "",
     ) -> None:
-        """Log a failed lesson split â€” key for identifying which lesson broke."""
+        """Log a failed lesson split.
+
+        Key for identifying which lesson broke during processing.
+
+        Args:
+            pdf_name: Name of the source PDF.
+            lesson_num: Lesson number.
+            error: Error message.
+            title: Lesson title.
+        """
         if self._current_step and self._current_step in self._step_stats:
             self._step_stats[self._current_step]["failed"] += 1
             self._step_stats[self._current_step]["failures"].append(
@@ -198,7 +254,12 @@ class PipelineLogger:
         self._logger.error(f"    Error: {error[:500]}")
 
     def lesson_skipped(self, pdf_name: str, reason: str = "") -> None:
-        """Log a skipped lesson (e.g. no raw_text)."""
+        """Log a skipped lesson.
+
+        Args:
+            pdf_name: Name of the source PDF.
+            reason: Reason for skipping (e.g., no raw_text).
+        """
         if self._current_step and self._current_step in self._step_stats:
             self._step_stats[self._current_step]["skipped"] += 1
         self._logger.warning(f"  [SKIP] {pdf_name}: {reason}")
@@ -207,9 +268,12 @@ class PipelineLogger:
     # Finish & summary
     # ------------------------------------------------------------------
     def finish(self) -> Path:
-        """
-        Finalize the run: write summary JSON, return path to error log.
+        """Finalize the run: write summary JSON, return path to error log.
+
         Call this at the end of the pipeline.
+
+        Returns:
+            Path to the summary JSON file.
         """
         total_elapsed = time.time() - self.start_time
 
@@ -258,15 +322,13 @@ class PipelineLogger:
             handler.close()
             self._logger.removeHandler(handler)
 
-        # Cleanup: remove error log if empty (after handlers closed)
+        # Cleanup: remove error log if empty
         if self.error_log_file.exists() and self.error_log_file.stat().st_size == 0:
             self.error_log_file.unlink()
 
-        return self.summary_file
         return self.summary_file
 
     @property
     def failures(self) -> List[Dict[str, Any]]:
         """Get list of all failures recorded so far."""
         return self._failures
-

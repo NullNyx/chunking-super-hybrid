@@ -1,6 +1,14 @@
-"""Sanity check for the chunking pipeline environment (no upload_qdrant deps).
+"""
+Environment Check / Kiểm tra môi trường
 
-Entry point: `uv run chunk-check-env` (configured in pyproject.toml).
+Input:
+- Kiểm tra dependencies đã cài đặt
+
+Output:
+- Print version info + exit code
+
+Usage:
+    uv run chunk-check-env
 """
 from __future__ import annotations
 
@@ -9,8 +17,14 @@ from pathlib import Path
 
 
 def main() -> int:
+    """Check environment and print version information.
+
+    Returns:
+        Exit code (0 for success).
+    """
     print("python:", sys.version.split()[0], "-", sys.executable)
 
+    # Import third-party dependencies
     import torch
     import torchvision
     import transformers
@@ -20,6 +34,7 @@ def main() -> int:
     import docling
     import docling_core
 
+    # Print version info
     print("torch       :", torch.__version__, "| cuda:", torch.cuda.is_available())
     if torch.cuda.is_available():
         print("device      :", torch.cuda.get_device_name(0))
@@ -31,15 +46,16 @@ def main() -> int:
     print("tiktoken    :", tiktoken.__version__)
     print("tqdm        :", tqdm.__version__)
 
-    # Pipeline modules import-only (no execution)
-    from src.extract_text_and_heading import run_one_pdf  # noqa: F401
-    from src.convert_text_raw_to_json import convert_folder  # noqa: F401
-    from src.merge_and_split_json import process_json_folder  # noqa: F401
-    from src.post_process_json import merge_all_lessons_to_one_json  # noqa: F401
+    # Verify pipeline modules can be imported
+    from src.b1_extract.extract_text_and_heading import run_one_pdf  # noqa: F401
+    from src.b2_convert.convert_text_raw_to_json import convert_folder  # noqa: F401
+    from src.b3_chunk.merge_and_split_json import process_json_folder  # noqa: F401
+    from src.b4_merge.post_process_json import merge_all_lessons_to_one_json  # noqa: F401
     print("pipeline modules import: OK")
 
-    # Resolve project root: when installed via uv, CWD is the project root,
-    # so prefer CWD/assets and fall back to the package-relative location.
+    # Verify required assets exist
+    # When installed via uv, CWD is the project root.
+    # Prefer CWD/assets, fall back to package-relative location.
     candidates = [
         Path.cwd() / "assets",
         Path(__file__).resolve().parents[1] / "assets",
