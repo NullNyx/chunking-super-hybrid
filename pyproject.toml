@@ -40,6 +40,7 @@ upload = [
 # Console scripts -> available via `uv run <name>`
 [project.scripts]
 chunk-pipeline = "src.cli:main"
+chunk-pipeline-ocr = "src.cli:main_ocr"
 chunk-check-env = "src.check_env:main"
 chunk-export = "src.export_zip:main"
 

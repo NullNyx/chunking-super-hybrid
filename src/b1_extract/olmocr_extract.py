@@ -1,24 +1,21 @@
 """
-olmOCR integration for PDF text extraction.
+B1 - OCR Fallback / Trích xuất text từ PDF qua OCR
 
-Uses the olmOCR server (hosted by Thành) to extract text from PDF files
-that have garbled font encoding (e.g., UTM fonts in Toán 9).
+Input:
+- PDF file (đặc biệt các file có font garbled như UTM trong sách Toán)
 
-The server renders PDF pages as images and performs OCR with a model
-optimized for Vietnamese text, returning markdown output with:
-- Full Vietnamese diacriticals
-- LaTeX formulas
-- HTML tables
-- Image references
+Output:
+- Markdown text với đầy đủ dấu tiếng Việt
+
+Workflow:
+1. Gửi PDF lên olmOCR server (render as images)
+2. OCR với model tối ưu cho tiếng Việt
+3. Trả về markdown: LaTeX, HTML tables, image references
 
 Usage:
-    from src.olmocr_extract import extract_pdf_via_olmocr, extract_pages_via_olmocr
+    from src.b1_extract.olmocr_extract import extract_pdf_via_olmocr
 
-    # Extract entire PDF
     markdown = extract_pdf_via_olmocr("input/toan/Toan_9_Tap_1.pdf")
-
-    # Extract specific page range
-    markdown = extract_pages_via_olmocr("input/toan/Toan_9_Tap_1.pdf", start=4, end=6)
 """
 from __future__ import annotations
 
@@ -30,7 +27,7 @@ from typing import Optional, Union
 
 import requests
 
-# Default olmOCR server URL (Thành's server)
+# Default olmOCR server URL
 OLMOCR_API_URL = "https://olmocr.aibuddy.vn/ocr"
 
 # Request settings

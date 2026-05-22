@@ -1,5 +1,18 @@
 """
-End-to-end pipeline entry point.
+CLI - End-to-end Pipeline Entry Point / Điều phối pipeline chính
+
+Input:
+- PDF files in input/
+
+Output:
+- Chunked JSON in outputs/
+
+Workflow:
+1. B1: PDF → TXT (Docling + CLIP heading detection)
+2. B2: TXT → JSON raw (convert_folder)
+3. B3: JSON chunking (semantic ~400 tokens)
+4. B4: Merge lessons to per-book JSON
+5. B5: Export ZIP for CMS
 
 Run via:
     uv run chunk-pipeline
@@ -18,11 +31,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Union, Tuple
 
 
-# -------------------------
-# SSL: make urllib trust certifi's CA bundle (Windows often lacks system CAs).
-# Must run BEFORE any code that downloads.
-# Re-applied inside each worker process (Windows uses spawn).
-# -------------------------
+# === SSL CONFIG ===
 def _ensure_ssl_ca_bundle() -> None:
     try:
         import certifi
@@ -44,15 +53,15 @@ os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "300")
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-from src.extract_text_and_heading import run_one_pdf
-from src.convert_text_raw_to_json import convert_folder
-from src.merge_and_split_json import process_json_folder
-from src.post_process_json import merge_all_lessons_to_one_json
+from src.b1_extract.extract_text_and_heading import run_one_pdf
+from src.b2_convert.convert_text_raw_to_json import convert_folder
+from src.b3_chunk.merge_and_split_json import process_json_folder
+from src.b4_merge.post_process_json import merge_all_lessons_to_one_json
+from src.pipeline_logger import PipelineLogger
 
 
 # -------------------------
-# Logging control
-# -------------------------
+# === LOGGING CONTROL ===
 def suppress_third_party_logs() -> None:
     for name in [
         "docling",
@@ -71,9 +80,9 @@ def suppress_third_party_logs() -> None:
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
-# ==========================================================
-# Worker for parallel PDF processing
-# ==========================================================
+# === WORKER ===
+
+# === STEP 1: PDFs -> TXT ===
 def _process_one_pdf_to_txt(
     pdf_path: str,
     input_root: str,
@@ -167,9 +176,7 @@ def _process_one_pdf_to_txt(
             shutil.rmtree(per_pdf_work_dir, ignore_errors=True)
 
 
-# -------------------------
-# Step 1: PDFs -> mirrored TXT (FAST)
-# -------------------------
+# === STEP 1: PDFs -> TXT ===
 def pdfs_to_mirrored_txt(
     input_root: Union[str, Path],
     *,
@@ -187,6 +194,7 @@ def pdfs_to_mirrored_txt(
     cleanup_work: bool = True,
     work_root: Optional[Union[str, Path]] = None,
     max_workers: int = 2,
+    pipeline_logger: Optional[PipelineLogger] = None,
 ) -> Dict[str, int]:
     """
     Speed-ups:
@@ -277,11 +285,17 @@ def pdfs_to_mirrored_txt(
             timings.append({"pdf": pdf, "seconds": float(secs), "status": status})
             if status == "ok":
                 stats["ok"] += 1
+                if pipeline_logger:
+                    pipeline_logger.pdf_ok(Path(pdf).name, elapsed=secs)
             elif status == "skipped":
                 stats["skipped"] += 1
+                if pipeline_logger:
+                    pipeline_logger.pdf_skipped(Path(pdf).name)
             else:
                 stats["failed"] += 1
                 failures.append({"pdf": pdf, "error": err or "unknown"})
+                if pipeline_logger:
+                    pipeline_logger.pdf_failed(Path(pdf).name, err or "unknown", elapsed=secs)
                 print("\n" + "=" * 120)
                 print(f"[FAILED] {pdf}")
                 print(err or "unknown")
@@ -322,11 +336,17 @@ def pdfs_to_mirrored_txt(
 
                 if status == "ok":
                     stats["ok"] += 1
+                    if pipeline_logger:
+                        pipeline_logger.pdf_ok(Path(pdf).name, elapsed=secs)
                 elif status == "skipped":
                     stats["skipped"] += 1
+                    if pipeline_logger:
+                        pipeline_logger.pdf_skipped(Path(pdf).name)
                 else:
                     stats["failed"] += 1
                     failures.append({"pdf": pdf, "error": err or "unknown"})
+                    if pipeline_logger:
+                        pipeline_logger.pdf_failed(Path(pdf).name, err or "unknown", elapsed=secs)
                     if status == "failed":
                         print("\n" + "=" * 120)
                         print(f"[FAILED] {pdf}")
@@ -360,9 +380,7 @@ def pdfs_to_mirrored_txt(
     return stats
 
 
-# -------------------------
-# Full E2E: PDFs -> Chunked JSON (+ optional merged)
-# -------------------------
+# === FULL E2E PIPELINE ===
 def run_e2e_pdf_folder_to_chunked_json(
     input_pdfs_root: Union[str, Path],
     *,
@@ -386,6 +404,7 @@ def run_e2e_pdf_folder_to_chunked_json(
     chunk_version: str = "v1",
     merge_all: bool = True,
     merged_out_version: str = "v2",
+    pipeline_logger: Optional[PipelineLogger] = None,
 ) -> Dict[str, str]:
     out_root = Path(out_root).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
@@ -396,6 +415,8 @@ def run_e2e_pdf_folder_to_chunked_json(
     merged_root = out_root / "04_merged_all"
 
     # 1) PDFs -> mirrored TXT
+    if pipeline_logger:
+        pipeline_logger.step_start("B1", "PDFs -> TXT (Docling + CLIP heading)")
     pdfs_to_mirrored_txt(
         input_pdfs_root,
         output_txt_root=txt_root,
@@ -412,16 +433,25 @@ def run_e2e_pdf_folder_to_chunked_json(
         cleanup_work=cleanup_work,
         work_root=out_root / "_work_tmp",
         max_workers=pdf_max_workers,
+        pipeline_logger=pipeline_logger,
     )
+    if pipeline_logger:
+        pipeline_logger.step_end("B1")
 
     # 2) TXT -> JSON raw
+    if pipeline_logger:
+        pipeline_logger.step_start("B2", "TXT -> JSON raw (convert_folder)")
     convert_folder(
         input_root=str(txt_root),
         output_root=str(json_raw_root),
         chunk_version=chunk_version,
     )
+    if pipeline_logger:
+        pipeline_logger.step_end("B2")
 
     # 3) JSON raw -> JSON chunked *MAIN CHUNKING
+    if pipeline_logger:
+        pipeline_logger.step_start("B3", "JSON chunking + overlap")
     process_json_folder(
         input_root=str(json_raw_root),
         output_root=str(json_chunked_root),
@@ -431,10 +461,14 @@ def run_e2e_pdf_folder_to_chunked_json(
         overlap_units=overlap_units,
         chunk_version=chunk_version,
     )
+    if pipeline_logger:
+        pipeline_logger.step_end("B3")
 
     # 4) Merge all lessons
     merged_path = ""
     if merge_all:
+        if pipeline_logger:
+            pipeline_logger.step_start("B4", "Merge all lessons")
         merged_root.mkdir(parents=True, exist_ok=True)
         merge_all_lessons_to_one_json(
             input_root=str(json_chunked_root),
@@ -442,6 +476,8 @@ def run_e2e_pdf_folder_to_chunked_json(
             out_version=merged_out_version,
         )
         merged_path = str(merged_root)
+        if pipeline_logger:
+            pipeline_logger.step_end("B4")
 
     return {
         "txt_root": str(txt_root),
@@ -451,22 +487,132 @@ def run_e2e_pdf_folder_to_chunked_json(
     }
 
 
-def main() -> None:
-    """Console entry point used by `uv run chunk-pipeline`."""
-    import sys
-
-    # Input root: default ./input, or pass as first argument
-    input_root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(r".\input")
-
-    # Auto-detect subject from input subfolder(s)
-    # e.g. input/toan/ → subject = "toan", out_root = outputs/toan/
+def _detect_subject_and_out_root(input_root: Path) -> Tuple[str, Path]:
+    """Auto-detect subject from input subfolder(s) and return (subject, out_root)."""
     subdirs = [d for d in input_root.iterdir() if d.is_dir()]
     if len(subdirs) == 1:
         subject = subdirs[0].name
     else:
         subject = input_root.name
-
     out_root = Path(r".\outputs") / subject
+    return subject, out_root
+
+
+def _run_export_step(
+    input_root: Path,
+    out_root: Path,
+    subject: str,
+    *,
+    use_olmocr: bool = False,
+    pipeline_logger: Optional[PipelineLogger] = None,
+) -> None:
+    """
+    B5: Page-based lesson splitting + ZIP export.
+
+    Args:
+        use_olmocr: If True, use olmOCR server for text extraction
+                    (for PDFs with garbled fonts like Toán 9).
+        pipeline_logger: Optional logger for structured run logging.
+    """
+    from src.b5_export.page_split import split_pdf_to_lessons
+    from src.b5_export.export_zip import export_to_zip
+    import re as _re
+
+    print("\n" + "=" * 60)
+    print(f"B5: Page-based lesson splitting + ZIP export"
+          f"{' [olmOCR]' if use_olmocr else ''}")
+    print("=" * 60)
+
+    if pipeline_logger:
+        pipeline_logger.step_start("B5", f"Page-based lesson splitting{' [olmOCR]' if use_olmocr else ''}")
+
+    export_txt_root = out_root / "05_export" / "txt"
+    pdf_files = list(Path(input_root).rglob("*.pdf"))
+
+    for pdf_path in sorted(pdf_files):
+        # Determine grade + volume from filename
+        # Pattern 1: TiengViet1_T1 → grade=1, volume=1
+        # Pattern 2: Toan_3_Tap_1 → grade=3, volume=1
+        # Pattern 3: Toan_3 → grade=3, volume=None
+        stem = pdf_path.stem
+
+        # Find all numbers in filename
+        numbers = _re.findall(r"\d+", stem)
+
+        if len(numbers) >= 2:
+            # Two numbers: first is grade, second is volume
+            grade = int(numbers[0])
+            volume = int(numbers[1])
+        elif len(numbers) == 1:
+            # One number: grade only
+            grade = int(numbers[0])
+            volume = None
+        else:
+            grade = 0
+            volume = None
+
+        lop_folder = f"Lop{grade}_{volume}" if volume else f"Lop{grade}"
+
+        # Find raw_text for TOC (from work_tmp)
+        rel = pdf_path.relative_to(Path(input_root))
+        work_dir = out_root / "_work_tmp" / rel.with_suffix("")
+        raw_text_path = work_dir / "raw_text.txt"
+
+        if not raw_text_path.exists():
+            print(f"  [SKIP] No raw_text for {pdf_path.name}")
+            if pipeline_logger:
+                pipeline_logger.lesson_skipped(pdf_path.name, "No raw_text.txt (TOC not available)")
+            continue
+
+        toc_text = raw_text_path.read_text(encoding="utf-8", errors="ignore")
+
+        # Output: subject/Lop{grade}_{volume}/LT/lesson{N}.txt
+        lesson_dir = export_txt_root / subject / lop_folder / "LT"
+
+        print(f"\n  {pdf_path.name} -> {lesson_dir}")
+
+        try:
+            result = split_pdf_to_lessons(pdf_path, toc_text, lesson_dir,
+                                          use_olmocr=use_olmocr,
+                                          pipeline_logger=pipeline_logger)
+            if pipeline_logger and not result:
+                pipeline_logger.lesson_skipped(pdf_path.name, "No lessons extracted from TOC")
+        except Exception as e:
+            err_msg = traceback.format_exc()
+            print(f"  [ERROR] {pdf_path.name}: {e}")
+            if pipeline_logger:
+                pipeline_logger.pdf_failed(pdf_path.name, err_msg)
+
+    # Create ZIP from the export folder
+    zip_path = str(out_root / "05_export" / f"{subject}.zip")
+    print(f"\n  Creating ZIP: {zip_path}")
+    try:
+        export_to_zip(str(export_txt_root), zip_path)
+    except Exception as e:
+        if pipeline_logger:
+            pipeline_logger.error(f"ZIP creation failed: {e}")
+
+    if pipeline_logger:
+        pipeline_logger.step_end("B5")
+
+
+def main() -> None:
+    """
+    Console entry point: `uv run chunk-pipeline`
+
+    Full pipeline (B1→B5): Docling extract + CLIP heading + chunking + page split.
+    Uses pypdfium2 for text extraction (works for PDFs with normal fonts).
+    """
+    import sys
+
+    # Input root: default ./input, or pass as first argument
+    input_root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(r".\input")
+    subject, out_root = _detect_subject_and_out_root(input_root)
+
+    # Initialize pipeline logger
+    plog = PipelineLogger(subject=subject)
+    plog.info(f"Input: {input_root}")
+    plog.info(f"Output: {out_root}")
 
     paths = run_e2e_pdf_folder_to_chunked_json(
         input_pdfs_root=str(input_root),
@@ -490,56 +636,253 @@ def main() -> None:
         chunk_version="v1",
         merge_all=True,
         merged_out_version="v1",
+        pipeline_logger=plog,
     )
-    print("DONE. Outputs:")
+    print("DONE (B1-B4). Outputs:")
     print(json.dumps(paths, ensure_ascii=False, indent=2))
+    plog.info("B1-B4 completed.")
 
-    # 5) Export to lesson .txt files using page-based splitting (precise boundaries)
-    from src.page_split import split_pdf_to_lessons
-    from src.export_zip import export_to_zip
+    # B5: Export using pypdfium2 (normal fonts)
+    _run_export_step(input_root, out_root, subject, use_olmocr=False, pipeline_logger=plog)
 
-    print("\n" + "=" * 60)
-    print("B5: Page-based lesson splitting + ZIP export")
+    # Finalize log
+    plog.finish()
+
+
+def main_ocr() -> None:
+    """
+    Console entry point: `uv run chunk-pipeline-ocr`
+
+    olmOCR pipeline (B5 only): Skips Docling extraction (B1-B4) and uses
+    olmOCR server for text extraction. Applies to ALL PDFs in the input folder
+    (not just garbled-font ones).
+
+    Requires:
+    - B1 already run (raw_text.txt exists for TOC parsing)
+    - olmOCR server running at https://olmocr.aibuddy.vn/ocr
+
+    Usage:
+        uv run chunk-pipeline-ocr [input_root]
+    """
+    import sys
+
+    input_root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(r".\input")
+    subject, out_root = _detect_subject_and_out_root(input_root)
+
+    # Verify raw_text exists (B1 must have been run before)
+    work_tmp = out_root / "_work_tmp"
+    if not work_tmp.exists():
+        print(f"ERROR: {work_tmp} not found.")
+        print("You must run `chunk-pipeline` first (at least B1) to generate raw_text.txt for TOC parsing.")
+        print("Then re-run this command to use olmOCR for text extraction.")
+        sys.exit(1)
+
+    # Initialize pipeline logger
+    plog = PipelineLogger(subject=f"{subject}_ocr")
+    plog.info(f"Input: {input_root}")
+    plog.info(f"Output: {out_root}")
+
     print("=" * 60)
+    print(f"olmOCR Pipeline — Subject: {subject}")
+    print(f"Input: {input_root}")
+    print(f"Output: {out_root}")
+    print("=" * 60)
+    print("\nSkipping B1-B4 (using existing raw_text for TOC).")
+    print("Using olmOCR server for ALL PDFs.\n")
 
-    # Find all PDFs and their corresponding raw_text (for TOC parsing)
-    import re as _re
+    # B5: Export ALL PDFs using olmOCR
+    _run_export_step(input_root, out_root, subject, use_olmocr=True, pipeline_logger=plog)
+
+    # Finalize log
+    plog.finish()
+
+
+def main_retry() -> None:
+    """
+    Console entry point: `uv run chunk-pipeline-retry`
+
+    Retry failed lessons from a previous pipeline run.
+    Reads the summary.json log file to find failed lessons and re-runs them.
+
+    Usage:
+        uv run chunk-pipeline-retry [input_root] [--max-retries N]
+    """
+    import sys
+    import json
+    from pathlib import Path
+
+    # Enable UTF-8 output for Vietnamese characters
+    if sys.platform == "win32":
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+
+    # Handle --help flag
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print("""
+Retry failed lessons from a previous pipeline run.
+
+Usage:
+    uv run chunk-pipeline-retry [input_root] [--max-retries N]
+
+Options:
+    input_root      Path to input folder (default: ./input)
+    --max-retries N  Maximum retry attempts (default: 3)
+
+Example:
+    uv run chunk-pipeline-retry
+    uv run chunk-pipeline-retry ./input --max-retries 5
+        """)
+        sys.exit(0)
+
+    max_retries = 3
+    # Handle --max-retries before finding input_root
+    if "--max-retries" in sys.argv:
+        idx = sys.argv.index("--max-retries")
+        if idx + 1 < len(sys.argv):
+            max_retries = int(sys.argv[idx + 1])
+            # Remove these args to find input_root
+            sys.argv = sys.argv[:idx] + sys.argv[idx + 2:]
+
+    input_root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(r".\input")
+
+    subject, out_root = _detect_subject_and_out_root(input_root)
+
+    # Find the latest log file (try both normal and _ocr runs)
+    log_dir = Path("logs")
+    summary_files = (
+        sorted(log_dir.glob(f"run_{subject}_*_summary.json"), reverse=True) +
+        sorted(log_dir.glob(f"run_{subject}_ocr_*_summary.json"), reverse=True)
+    )
+
+    if not summary_files:
+        print(f"ERROR: No summary.json found for subject '{subject}' in logs/")
+        print("Run the pipeline first to generate logs.")
+        sys.exit(1)
+
+    summary_path = summary_files[0]
+    print(f"Loading failures from: {summary_path.name}")
+
+    with open(summary_path, encoding="utf-8") as f:
+        summary = json.load(f)
+
+    failures = summary.get("failures", [])
+    if not failures:
+        print("No failures found in the summary file.")
+        sys.exit(0)
+
+    print(f"Found {len(failures)} failed lessons to retry (max {max_retries} retries each)")
+
+    # Group failures by PDF
+    failures_by_pdf: dict[str, list[dict]] = {}
+    for failure in failures:
+        pdf = failure["pdf"]
+        if pdf not in failures_by_pdf:
+            failures_by_pdf[pdf] = []
+        failures_by_pdf[pdf].append(failure)
+
+    # Initialize logger for retry run
+    plog = PipelineLogger(subject=f"{subject}_retry")
+    plog.info(f"Retry run for {len(failures)} failed lessons")
+    plog.info(f"Source log: {summary_path.name}")
+
+    # Process each PDF with failures
     export_txt_root = out_root / "05_export" / "txt"
-    pdf_files = list(Path(input_root).rglob("*.pdf"))
 
-    for pdf_path in sorted(pdf_files):
-        # Determine grade + volume from filename
-        # e.g. Toan_3_Tap_1 → grade=3, volume=1 → "Lop3_1"
-        # e.g. Toan_3 (no Tap) → grade=3, volume=None → "Lop3"
+    for pdf_name, pdf_failures in failures_by_pdf.items():
+        # Find the PDF file
+        pdf_files = list(Path(input_root).rglob(pdf_name))
+        if not pdf_files:
+            print(f"[SKIP] PDF not found: {pdf_name}")
+            plog.warning(f"PDF not found: {pdf_name}")
+            continue
+        pdf_path = pdf_files[0]
+
+        # Determine grade/volume
+        import re as _re
         grade_match = _re.search(r"[_\s](\d{1,2})[_\s]", pdf_path.stem)
         grade = int(grade_match.group(1)) if grade_match else 0
-
         volume_match = _re.search(r"[Tt](?:ap|ập)[_\s]*(\d+)", pdf_path.stem)
         volume = int(volume_match.group(1)) if volume_match else None
-
         lop_folder = f"Lop{grade}_{volume}" if volume else f"Lop{grade}"
 
-        # Find raw_text for TOC (from work_tmp)
+        # Find raw_text for TOC
         rel = pdf_path.relative_to(Path(input_root))
         work_dir = out_root / "_work_tmp" / rel.with_suffix("")
         raw_text_path = work_dir / "raw_text.txt"
 
         if not raw_text_path.exists():
-            print(f"  [SKIP] No raw_text for {pdf_path.name}")
+            print(f"[SKIP] No raw_text for {pdf_name}")
             continue
 
         toc_text = raw_text_path.read_text(encoding="utf-8", errors="ignore")
 
-        # Output: subject/Lop{grade}_{volume}/LT/lesson{N}.txt
+        # Output directory
         lesson_dir = export_txt_root / subject / lop_folder / "LT"
+        lesson_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"\n  {pdf_path.name} -> {lesson_dir}")
-        split_pdf_to_lessons(pdf_path, toc_text, lesson_dir)
+        print(f"\n  Retrying {len(pdf_failures)} lessons from {pdf_name}")
 
-    # Create ZIP from the export folder
-    zip_path = str(out_root / "05_export" / f"{subject}.zip")
-    print(f"\n  Creating ZIP: {zip_path}")
-    export_to_zip(str(export_txt_root), zip_path)
+        # Retry each failed lesson
+        from src.b5_export.page_split import split_pdf_to_lessons
+        from src.b5_export.page_split import parse_toc_from_text, _split_pdf_to_lessons_olmocr
+        from src.b1_extract.olmocr_extract import extract_pages_via_olmocr
+
+        toc = parse_toc_from_text(toc_text)
+        toc_by_num = {entry.lesson_num: entry for entry in toc}
+
+        # Track retry results
+        retry_ok = 0
+        retry_failed = 0
+
+        for failure in pdf_failures:
+            lesson_num = failure["lesson_num"]
+            title = failure.get("title", f"Bài {lesson_num}")
+            error = failure.get("error", "Unknown")
+
+            print(f"\n    Retry lesson {lesson_num}: {title[:30]}...")
+            print(f"      Previous error: {error[:80]}")
+
+            if lesson_num not in toc_by_num:
+                print(f"      [SKIP] Lesson {lesson_num} not found in TOC")
+                continue
+
+            entry = toc_by_num[lesson_num]
+            start = entry.start_page - 1  # 0-indexed
+            end = start + 20  # Assume up to 20 pages per lesson
+
+            # Retry loop
+            for attempt in range(1, max_retries + 1):
+                print(f"      Attempt {attempt}/{max_retries}...", end=" ")
+                markdown, err = extract_pages_via_olmocr(
+                    pdf_path, start, end, return_error=True
+                )
+
+                if markdown:
+                    # Success - write the file
+                    from src.b5_export.page_split import _markdown_to_plain_text
+                    content = _markdown_to_plain_text(markdown)
+                    out_text = f"##Title: Bài {lesson_num}. {title}\n\n{content}\n"
+                    out_path = lesson_dir / f"lesson{lesson_num}.txt"
+                    out_path.write_bytes(out_text.replace("\n", "\r\n").encode("utf-8"))
+                    print(f"OK ({len(content)} chars)")
+                    plog.lesson_ok(pdf_name, lesson_num, title)
+                    retry_ok += 1
+                    break
+                else:
+                    error_detail = err or "Empty response"
+                    print(f"FAILED: {error_detail[:50]}")
+                    if attempt < max_retries:
+                        import time
+                        time.sleep(2)  # Wait before retry
+            else:
+                print(f"      ❌ All {max_retries} retries failed")
+                plog.lesson_failed(pdf_name, lesson_num, error, title=title)
+                retry_failed += 1
+
+        print(f"\n  Retry complete: {retry_ok} OK, {retry_failed} failed")
+
+    plog.finish()
+    print("\nRetry run complete!")
 
 
 if __name__ == "__main__":
