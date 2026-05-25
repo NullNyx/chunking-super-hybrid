@@ -37,3 +37,9 @@ _work_tmp/
 # Large PDF datasets (not for version control)
 input/
 *.pdf
+
+# Harness durable layer
+harness.db
+harness.db-wal
+harness.db-shm
+scripts/bin/harness-cli
