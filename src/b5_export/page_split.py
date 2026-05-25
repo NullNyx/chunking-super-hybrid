@@ -44,6 +44,17 @@ _KNOWN_SECTION_HEADERS = {
 
 # Pattern for standalone "Số" lines (e.g., "Số", "Số 5", "Số12")
 _SO_PATTERN = re.compile(r"^Số\s?\d*$")
+_TOC_VIETNAMESE_GLYPH_FIXES = [
+    (re.compile(r"/abthnangp", re.IGNORECASE), "ập"),
+    (re.compile(r"/ebthhoi", re.IGNORECASE), "ể"),
+    (re.compile(r"/ebthnangn", re.IGNORECASE), "ện"),
+    (re.compile(r"/dhoa", re.IGNORECASE), "đ"),
+    (re.compile(r"/dth", re.IGNORECASE), "đ"),
+    (re.compile(r"/ochoa", re.IGNORECASE), "ơ"),
+    (re.compile(r"/octh", re.IGNORECASE), "ơ"),
+    (re.compile(r"/uchoa", re.IGNORECASE), "ư"),
+    (re.compile(r"/ucth", re.IGNORECASE), "ư"),
+]
 
 
 # === HELPER FUNCTIONS ===
@@ -166,6 +177,81 @@ class TocEntry:
     start_page: int  # 1-indexed (as printed in book)
 
 
+def _normalize_toc_text(text: str) -> str:
+    normalized = text
+    for pattern, replacement in _TOC_VIETNAMESE_GLYPH_FIXES:
+        normalized = pattern.sub(replacement, normalized)
+    normalized = normalized.replace("L/ochoasacp", "LỚP")
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized
+
+
+def _extract_toc_entries_from_line(line: str) -> List[TocEntry]:
+    entries: List[TocEntry] = []
+    normalized_line = _normalize_toc_text(line)
+    normalized_line = normalized_line.replace(
+        "Ôn t/abthnangp và k/ebthhoi chuy/ebthnangn", "Ôn tập và kể chuyện"
+    )
+    if "|" in normalized_line:
+        cells = [cell.strip() for cell in normalized_line.split("|")]
+        for index in range(len(cells) - 2):
+            lesson_match = re.match(r"(?i)^Bài\s+(\d+)\.?\s*$", cells[index])
+            if not lesson_match:
+                continue
+            title = cells[index + 1].strip()
+            page_match = re.match(r"^\d+$", cells[index + 2])
+            if title and page_match:
+                entries.append(TocEntry(
+                    lesson_num=int(lesson_match.group(1)),
+                    title=title,
+                    start_page=int(page_match.group(0)),
+                ))
+        if entries:
+            return entries
+
+    table_matches = list(re.finditer(
+        r"(?i)\|\s*(?:\|?)\s*Bài\s+(\d+)\.?\s*\|(.+?)\|\s*(\d+)\s*\|",
+        normalized_line,
+    ))
+    if table_matches:
+        for match in table_matches:
+            entries.append(TocEntry(
+                lesson_num=int(match.group(1)),
+                title=match.group(2).strip(),
+                start_page=int(match.group(3)),
+            ))
+        if len(entries) > 1:
+            return entries
+        if entries:
+            return entries
+
+    plain_matches = list(re.finditer(
+        r"(?i)\bBài\s+(\d+)\.?\s+(.+?)\s+(\d+)\s*$",
+        normalized_line,
+    ))
+    if plain_matches:
+        for match in plain_matches:
+            entries.append(TocEntry(
+                lesson_num=int(match.group(1)),
+                title=match.group(2).strip(),
+                start_page=int(match.group(3)),
+            ))
+        return entries
+
+    compact_matches = list(re.finditer(
+        r"(?i)\bBài\s+(\d+)\b\s+(.+?)\s+(\d+)",
+        normalized_line,
+    ))
+    for match in compact_matches:
+        entries.append(TocEntry(
+            lesson_num=int(match.group(1)),
+            title=match.group(2).strip(),
+            start_page=int(match.group(3)),
+        ))
+
+    return entries
+
+
 def parse_toc_from_text(text: str) -> List[TocEntry]:
     """Parse table of contents from Docling-extracted text.
 
@@ -182,25 +268,55 @@ def parse_toc_from_text(text: str) -> List[TocEntry]:
         List of TocEntry objects sorted by lesson number.
     """
     entries: List[TocEntry] = []
+    normalized_text = _normalize_toc_text(text)
 
-    # Format 1 & 2: Table format with pipes
-    TOC_TABLE_RE = re.compile(
-        r"(?i)\|\s*(?:\|?)\s*Bài\s+(\d+)\.?\s*\|(.+?)\|\s*(\d+)\s*\|"
-    )
-    for line in text.splitlines():
-        m = TOC_TABLE_RE.search(line)
-        if m:
-            entries.append(TocEntry(
-                lesson_num=int(m.group(1)),
-                title=m.group(2).strip(),
-                start_page=int(m.group(3)),
-            ))
+    # Format 1: Table format with "Bài" keyword (Toán style)
+    # | Bài 1 | Content | 14 |
+    # Format 2: Table format with week/lesson columns (Tiếng Việt 5 style)
+    for line in normalized_text.splitlines():
+        # Skip header/separator lines
+        if line.startswith("|---") or line.startswith("| Tuần"):
+            continue
+
+        if "|" in line:
+            line_entries = _extract_toc_entries_from_line(line)
+            if line_entries:
+                entries.extend(line_entries)
+                continue
+
+            alt_match = re.search(
+                r"(?i)\|\s*\d+\s*\|\s*(\d+)\s*\|.+?\|\s*(\d+)\s*\|?",
+                line,
+            )
+            if alt_match:
+                entries.append(TocEntry(
+                    lesson_num=int(alt_match.group(1)),
+                    title="",
+                    start_page=int(alt_match.group(2)),
+                ))
+                continue
+
+            simple_match = re.search(
+                r"(?i)\|\s*\d+\s*\|\s*(\d+)\s*\|[^|]*\|\s*(\d+)",
+                line,
+            )
+            if simple_match:
+                entries.append(TocEntry(
+                    lesson_num=int(simple_match.group(1)),
+                    title="",
+                    start_page=int(simple_match.group(2)),
+                ))
+                continue
+
+        line_entries = _extract_toc_entries_from_line(line)
+        if line_entries:
+            entries.extend(line_entries)
 
     if entries:
         return entries
 
     # Format 3 & 4: Plain text "Bài X" pattern with page numbers
-    lines = text.splitlines()
+    lines = normalized_text.splitlines()
     BAI_LINE_RE = re.compile(r"(?i)^\s*Bài\s+(\d+)\.?\s*(.*)$")
     PAGE_NUM_RE = re.compile(r"^\s*(\d+)\s*$")
 
@@ -306,6 +422,7 @@ def split_pdf_to_lessons(
     toc_text: str,
     output_dir: Union[str, Path],
     *,
+    use_olmocr: bool = False,
     verbose: bool = True,
     pipeline_logger=None,
 ) -> Dict[int, Path]:
@@ -336,6 +453,12 @@ def split_pdf_to_lessons(
 
     if verbose:
         _safe_print(f"  Found {len(entries)} lessons in TOC")
+
+    if use_olmocr:
+        return _split_pdf_to_lessons_olmocr(
+            pdf_path, toc_text, output_dir,
+            verbose=verbose,
+        )
 
     # Open PDF
     pdf_doc = pdfium.PdfDocument(pdf_path)
@@ -384,6 +507,7 @@ def split_pdf_to_lessons(
     if verbose:
         _safe_print(f"\n  Total: {len(output_paths)} lessons written")
 
+    pdf_doc.close()
     return output_paths
 
 

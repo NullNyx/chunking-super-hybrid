@@ -45,6 +45,65 @@ def _safe_print(s: str) -> None:
         pass
 
 
+MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024  # 50MB - under Cloudflare limit
+CHUNK_SIZE_PAGES = 20  # Pages per chunk
+
+
+def _extract_large_pdf_in_chunks(
+    pdf_path: Path,
+    *,
+    api_url: str,
+    timeout: int,
+    max_retries: int,
+    retry_delay: int,
+) -> Optional[str]:
+    """
+    Extract large PDF by splitting into page chunks and OCRing each.
+
+    Args:
+        pdf_path: Path to the large PDF file
+        api_url: olmOCR server URL
+        timeout: Request timeout in seconds
+        max_retries: Number of retry attempts per chunk
+        retry_delay: Seconds between retries
+
+    Returns:
+        Combined markdown text from all chunks, or None if any chunk failed
+    """
+    import fitz
+
+    doc = fitz.open(str(pdf_path))
+    total_pages = doc.page_count
+    doc.close()
+
+    _safe_print(f"[olmOCR] Total pages: {total_pages}, chunk size: {CHUNK_SIZE_PAGES}")
+
+    all_markdown: list[str] = []
+    num_chunks = (total_pages + CHUNK_SIZE_PAGES - 1) // CHUNK_SIZE_PAGES
+
+    for chunk_idx in range(num_chunks):
+        start = chunk_idx * CHUNK_SIZE_PAGES
+        end = min(start + CHUNK_SIZE_PAGES, total_pages) - 1
+
+        _safe_print(f"[olmOCR] Processing chunk {chunk_idx + 1}/{num_chunks}: pages {start + 1}-{end + 1}...")
+
+        result = extract_pages_via_olmocr(
+            pdf_path, start, end,
+            api_url=api_url, timeout=timeout,
+            return_error=False,
+        )
+
+        if result is None:
+            _safe_print(f"[olmOCR] Chunk {chunk_idx + 1} failed, aborting full extraction")
+            return None
+
+        all_markdown.append(result)
+
+    combined = "\n\n".join(all_markdown)
+    _safe_print(f"[olmOCR] Combined {len(all_markdown)} chunks: {len(combined)} total chars")
+    return combined
+
+
 def extract_pdf_via_olmocr(
     pdf_path: Union[str, Path],
     *,
@@ -55,6 +114,9 @@ def extract_pdf_via_olmocr(
 ) -> Optional[str]:
     """
     Send a PDF file to olmOCR server and return the markdown text.
+
+    For large PDFs (>50MB), automatically splits into chunks to avoid
+    Cloudflare 413 Payload Too Large errors.
 
     Args:
         pdf_path: Path to the PDF file
@@ -70,6 +132,11 @@ def extract_pdf_via_olmocr(
     if not pdf_path.exists():
         _safe_print(f"[olmOCR] File not found: {pdf_path}")
         return None
+
+    file_size = pdf_path.stat().st_size
+    if file_size > MAX_FILE_SIZE_BYTES:
+        _safe_print(f"[olmOCR] File {pdf_path.name} ({file_size / 1024 / 1024:.1f}MB) > {MAX_FILE_SIZE_BYTES / 1024 / 1024:.0f}MB - splitting into chunks...")
+        return _extract_large_pdf_in_chunks(pdf_path, api_url=api_url, timeout=timeout, max_retries=max_retries, retry_delay=retry_delay)
 
     last_error = None
 
@@ -259,3 +326,54 @@ def split_pdf_to_lesson_pdfs_and_ocr(
                     _safe_print(f"  ❌ Lesson {lesson_num} failed")
 
     return results
+
+
+def extract_pdf_via_olmocr_to_files(
+    pdf_path: Union[str, Path],
+    *,
+    out_dir: Union[str, Path],
+    path_labels_heading: Union[str, Path],
+    api_url: str = OLMOCR_API_URL,
+    timeout: int = REQUEST_TIMEOUT,
+) -> Optional[dict]:
+    """
+    OCR a whole PDF and materialize B1-like raw text artifacts.
+
+    This writes:
+    - raw_markdown.txt: markdown returned by olmOCR
+    - raw_text.txt: normalized plain text used by downstream pipeline steps
+    """
+    from src.b1_extract.extract_text_and_heading import inject_headings
+    from src.b5_export.page_split import _markdown_to_plain_text
+
+    pdf_path = Path(pdf_path)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    markdown = extract_pdf_via_olmocr(pdf_path, api_url=api_url, timeout=timeout)
+    if not markdown:
+        return None
+
+    raw_text = _markdown_to_plain_text(markdown).strip() + "\n"
+    empty_labels_path = out_dir / "labels.tsv"
+    empty_labels_path.write_text("", encoding="utf-8")
+    text_with_headings, inserted, dropped = inject_headings(
+        label_tsv_path=empty_labels_path,
+        text_with_images=markdown,
+        path_labels_heading=path_labels_heading,
+        drop_unlabeled_images=True,
+    )
+
+    (out_dir / "raw_markdown.txt").write_text(markdown, encoding="utf-8")
+    (out_dir / "raw_text.txt").write_text(raw_text, encoding="utf-8")
+    (out_dir / "raw_with_headings.txt").write_text(text_with_headings, encoding="utf-8")
+
+    return {
+        "pdf": str(pdf_path),
+        "out_dir": str(out_dir),
+        "raw_markdown_path": str(out_dir / "raw_markdown.txt"),
+        "raw_text_path": str(out_dir / "raw_text.txt"),
+        "raw_with_headings_path": str(out_dir / "raw_with_headings.txt"),
+        "num_headings_inserted": inserted,
+        "num_images_dropped": dropped,
+    }
