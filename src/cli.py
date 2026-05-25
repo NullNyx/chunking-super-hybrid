@@ -52,8 +52,10 @@ os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "300")
 
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 from src.b1_extract.extract_text_and_heading import run_one_pdf
+from src.b1_extract.olmocr_extract import extract_pdf_via_olmocr_to_files
 from src.b2_convert.convert_text_raw_to_json import convert_folder
 from src.b3_chunk.merge_and_split_json import process_json_folder
 from src.b4_merge.post_process_json import merge_all_lessons_to_one_json
@@ -81,100 +83,6 @@ def suppress_third_party_logs() -> None:
 
 
 # === WORKER ===
-
-# === STEP 1: PDFs -> TXT ===
-def _process_one_pdf_to_txt(
-    pdf_path: str,
-    input_root: str,
-    output_txt_root: str,
-    work_root: str,
-    prototypes_path: str,
-    labels_heading_json: str,
-    n_pages: Optional[int],
-    test_fast: bool,
-    clip_score_threshold: float,
-    clip_device: Optional[str],
-    drop_unlabeled_images: bool,
-    label_mode: str,
-    overwrite: bool,
-    cleanup_work: bool,
-) -> Tuple[str, str, Optional[str], float]:
-    """
-    Returns: (status, pdf_path, error, seconds)
-      status in {"ok", "skipped", "failed"}
-    """
-    _ensure_ssl_ca_bundle()
-    suppress_third_party_logs()
-
-    pdf_path_p = Path(pdf_path)
-    input_root_p = Path(input_root)
-    output_txt_root_p = Path(output_txt_root)
-    work_root_p = Path(work_root)
-
-    t0 = time.time()
-
-    rel_pdf = pdf_path_p.relative_to(input_root_p)
-    out_txt_path = (output_txt_root_p / rel_pdf).with_suffix(".txt")
-    out_txt_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if out_txt_path.exists() and not overwrite:
-        return ("skipped", str(pdf_path_p), None, time.time() - t0)
-
-    per_pdf_work_dir = work_root_p / rel_pdf.with_suffix("")
-    per_pdf_work_dir.mkdir(parents=True, exist_ok=True)
-
-    if not Path(prototypes_path).exists():
-        raise FileNotFoundError(f"prototypes_path not found: {prototypes_path}")
-    if not Path(labels_heading_json).exists():
-        raise FileNotFoundError(f"labels_heading_json not found: {labels_heading_json}")
-
-    # Retry logic for transient errors (network, timeout, SSL)
-    MAX_RETRIES = 3
-    RETRY_ERRORS = (OSError, ConnectionError, TimeoutError)
-
-    try:
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                run_one_pdf(
-                    pdf_path=pdf_path_p,
-                    out_dir=per_pdf_work_dir,
-                    prototypes_path=prototypes_path,
-                    n_pages=n_pages,
-                    test_fast=test_fast,
-                    keep_docling_dir=True,
-                    clip_score_threshold=clip_score_threshold,
-                    path_labels_heading=labels_heading_json,
-                    clip_device=clip_device,
-                    drop_unlabeled_images=drop_unlabeled_images,
-                    label_mode=label_mode,
-                )
-
-                produced_txt = per_pdf_work_dir / "raw_with_headings.txt"
-                if not produced_txt.exists():
-                    raise FileNotFoundError(f"Pipeline did not produce: {produced_txt}")
-
-                out_txt_path.write_text(
-                    produced_txt.read_text(encoding="utf-8", errors="ignore"),
-                    encoding="utf-8",
-                )
-
-                return ("ok", str(pdf_path_p), None, time.time() - t0)
-
-            except RETRY_ERRORS as e:
-                if attempt < MAX_RETRIES:
-                    wait = attempt * 10  # 10s, 20s, 30s
-                    print(f"  [RETRY {attempt}/{MAX_RETRIES}] {pdf_path_p.name}: {type(e).__name__}: {e} — waiting {wait}s...", flush=True)
-                    time.sleep(wait)
-                    continue
-                return ("failed", str(pdf_path_p), traceback.format_exc(), time.time() - t0)
-
-            except Exception:
-                return ("failed", str(pdf_path_p), traceback.format_exc(), time.time() - t0)
-
-    finally:
-        if cleanup_work:
-            shutil.rmtree(per_pdf_work_dir, ignore_errors=True)
-
 
 # === STEP 1: PDFs -> TXT ===
 def pdfs_to_mirrored_txt(
@@ -207,7 +115,6 @@ def pdfs_to_mirrored_txt(
     output_txt_root = Path(output_txt_root).resolve()
     output_txt_root.mkdir(parents=True, exist_ok=True)
 
-    # convert relative -> absolute ONCE (important when using ProcessPool on Windows)
     prototypes_path = str(Path(prototypes_path).resolve())
     labels_heading_json = str(Path(labels_heading_json).resolve())
 
@@ -215,7 +122,6 @@ def pdfs_to_mirrored_txt(
         raise FileNotFoundError(f"prototypes_path not found: {prototypes_path}")
     if not Path(labels_heading_json).exists():
         raise FileNotFoundError(f"labels_heading_json not found: {labels_heading_json}")
-
     if not input_root.exists():
         raise FileNotFoundError(f"input_root not found: {input_root}")
 
@@ -233,13 +139,13 @@ def pdfs_to_mirrored_txt(
         if name.startswith("~$"):
             return False
         try:
-            if p.stat().st_size < 1024:  # < 1KB
+            if p.stat().st_size < 1024:
                 return False
         except OSError:
             return False
         return True
 
-    pdf_paths = (list(input_root.rglob("*.pdf")) if recursive else list(input_root.glob("*.pdf")))
+    pdf_paths = list(input_root.rglob("*.pdf")) if recursive else list(input_root.glob("*.pdf"))
     pdf_paths = [p for p in pdf_paths if _is_real_pdf(p)]
     pdf_paths.sort(key=lambda p: str(p).lower())
 
@@ -254,16 +160,13 @@ def pdfs_to_mirrored_txt(
         )
         return stats
 
-    # Avoid GPU contention when CLIP runs on CUDA.
     if clip_device and str(clip_device).lower().startswith("cuda"):
         max_workers = 1
     else:
         max_workers = max(1, int(max_workers))
 
-    pbar = tqdm(total=len(pdf_paths), desc="1/4 PDFs -> TXT", unit="pdf")
+    pbar = tqdm(total=len(pdf_paths), desc="1/4 PDFs -> TXT", unit="pdf", leave=False)
 
-    # When max_workers == 1, run in-process to avoid Windows spawn deadlocks
-    # (PyTorch + multiprocessing on Windows is fragile).
     if max_workers <= 1:
         for pdf_path in pdf_paths:
             status, pdf, err, secs = _process_one_pdf_to_txt(
@@ -301,9 +204,7 @@ def pdfs_to_mirrored_txt(
                 print(err or "unknown")
                 print("=" * 120 + "\n")
             pbar.update(1)
-            pbar.set_postfix(
-                {"ok": stats["ok"], "skip": stats["skipped"], "fail": stats["failed"]}
-            )
+            pbar.set_postfix({"ok": stats["ok"], "skip": stats["skipped"], "fail": stats["failed"]})
     else:
         futures = []
         with ProcessPoolExecutor(max_workers=max_workers) as ex:
@@ -347,15 +248,12 @@ def pdfs_to_mirrored_txt(
                     failures.append({"pdf": pdf, "error": err or "unknown"})
                     if pipeline_logger:
                         pipeline_logger.pdf_failed(Path(pdf).name, err or "unknown", elapsed=secs)
-                    if status == "failed":
-                        print("\n" + "=" * 120)
-                        print(f"[FAILED] {pdf}")
-                        print(err or "unknown")
-                        print("=" * 120 + "\n")
+                    print("\n" + "=" * 120)
+                    print(f"[FAILED] {pdf}")
+                    print(err or "unknown")
+                    print("=" * 120 + "\n")
                 pbar.update(1)
-                pbar.set_postfix(
-                    {"ok": stats["ok"], "skip": stats["skipped"], "fail": stats["failed"]}
-                )
+                pbar.set_postfix({"ok": stats["ok"], "skip": stats["skipped"], "fail": stats["failed"]})
 
     pbar.close()
 
@@ -379,6 +277,112 @@ def pdfs_to_mirrored_txt(
 
     return stats
 
+
+def pdfs_to_mirrored_txt_ocr(
+    input_root: Union[str, Path],
+    *,
+    output_txt_root: Union[str, Path],
+    recursive: bool = True,
+    overwrite: bool = False,
+    work_root: Optional[Union[str, Path]] = None,
+    max_workers: int = 3,
+    pipeline_logger: Optional[PipelineLogger] = None,
+) -> Dict[str, int]:
+    input_root = Path(input_root).resolve()
+    output_txt_root = Path(output_txt_root).resolve()
+    output_txt_root.mkdir(parents=True, exist_ok=True)
+
+    if work_root is None:
+        work_root = output_txt_root / "_work_tmp"
+    work_root = Path(work_root).resolve()
+    work_root.mkdir(parents=True, exist_ok=True)
+
+    pdf_paths = list(input_root.rglob("*.pdf")) if recursive else list(input_root.glob("*.pdf"))
+    pdf_paths = [p for p in pdf_paths if p.is_file() and p.stat().st_size >= 1024]
+    pdf_paths.sort(key=lambda p: str(p).lower())
+
+    stats = {"total": len(pdf_paths), "ok": 0, "skipped": 0, "failed": 0}
+    failures: List[Dict[str, str]] = []
+
+    if not pdf_paths:
+        (output_txt_root / "_failures.json").write_text("[]", encoding="utf-8")
+        (output_txt_root / "_stats.json").write_text(
+            json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return stats
+
+    pbar = tqdm(total=len(pdf_paths), desc="1/4 PDFs -> TXT [olmOCR]", unit="pdf", leave=False)
+
+    def _ocr_one_pdf(pdf_path: Path) -> tuple[str, str, Optional[str]]:
+        rel_pdf = pdf_path.relative_to(input_root)
+        out_txt_path = (output_txt_root / rel_pdf).with_suffix(".txt")
+        out_txt_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if out_txt_path.exists() and not overwrite:
+            return ("skipped", str(pdf_path), None)
+
+        per_pdf_work_dir = work_root / rel_pdf.with_suffix("")
+        per_pdf_work_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            result = extract_pdf_via_olmocr_to_files(
+                pdf_path,
+                out_dir=per_pdf_work_dir,
+                path_labels_heading=r".\assets\labels_heading.json",
+            )
+            if not result:
+                raise RuntimeError("olmOCR returned no markdown")
+
+            raw_text_path = per_pdf_work_dir / "raw_text.txt"
+            if not raw_text_path.exists():
+                raise FileNotFoundError(f"Missing OCR output: {raw_text_path}")
+
+            out_txt_path.write_text(
+                raw_text_path.read_text(encoding="utf-8", errors="ignore"),
+                encoding="utf-8",
+            )
+            return ("ok", str(pdf_path), None)
+        except Exception:
+            err = traceback.format_exc()
+            return ("failed", str(pdf_path), err)
+
+    max_workers = max(1, int(max_workers))
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_ocr_one_pdf, pdf_path): pdf_path for pdf_path in pdf_paths}
+        for fut in as_completed(futures):
+            status, pdf, err = fut.result()
+            pdf_name = Path(pdf).name
+            if status == "ok":
+                stats["ok"] += 1
+                if pipeline_logger:
+                    pipeline_logger.pdf_ok(pdf_name)
+            elif status == "skipped":
+                stats["skipped"] += 1
+                if pipeline_logger:
+                    pipeline_logger.pdf_skipped(pdf_name)
+            else:
+                stats["failed"] += 1
+                failures.append({"pdf": pdf, "error": err or "unknown"})
+                if pipeline_logger:
+                    pipeline_logger.pdf_failed(pdf_name, err or "unknown")
+                print("\n" + "=" * 120)
+                print(f"[FAILED] {pdf}")
+                print(err or "unknown")
+                print("=" * 120 + "\n")
+
+            pbar.update(1)
+            pbar.set_postfix({"ok": stats["ok"], "skip": stats["skipped"], "fail": stats["failed"]})
+
+    pbar.close()
+
+    (output_txt_root / "_failures.json").write_text(
+        json.dumps(failures, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (output_txt_root / "_stats.json").write_text(
+        json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    return stats
 
 # === FULL E2E PIPELINE ===
 def run_e2e_pdf_folder_to_chunked_json(
@@ -465,6 +469,90 @@ def run_e2e_pdf_folder_to_chunked_json(
         pipeline_logger.step_end("B3")
 
     # 4) Merge all lessons
+    merged_path = ""
+    if merge_all:
+        if pipeline_logger:
+            pipeline_logger.step_start("B4", "Merge all lessons")
+        merged_root.mkdir(parents=True, exist_ok=True)
+        merge_all_lessons_to_one_json(
+            input_root=str(json_chunked_root),
+            output_root=str(merged_root),
+            out_version=merged_out_version,
+        )
+        merged_path = str(merged_root)
+        if pipeline_logger:
+            pipeline_logger.step_end("B4")
+
+    return {
+        "txt_root": str(txt_root),
+        "json_raw_root": str(json_raw_root),
+        "json_chunked_root": str(json_chunked_root),
+        "merged_root": merged_path,
+    }
+
+
+def run_e2e_pdf_folder_to_chunked_json_ocr(
+    input_pdfs_root: Union[str, Path],
+    *,
+    out_root: Union[str, Path],
+    recursive: bool = True,
+    overwrite_txt: bool = False,
+    max_workers: int = 3,
+    min_tokens: int = 200,
+    target_tokens: int = 350,
+    max_tokens: int = 650,
+    overlap_units: int = 2,
+    chunk_version: str = "v1",
+    merge_all: bool = True,
+    merged_out_version: str = "v2",
+    pipeline_logger: Optional[PipelineLogger] = None,
+) -> Dict[str, str]:
+    out_root = Path(out_root).resolve()
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    txt_root = out_root / "01_extract_txt_raw"
+    json_raw_root = out_root / "02_convert_json_raw"
+    json_chunked_root = out_root / "03_chunked_raw"
+    merged_root = out_root / "04_merged_all"
+
+    if pipeline_logger:
+        pipeline_logger.step_start("B1", "PDFs -> TXT (olmOCR)")
+    pdfs_to_mirrored_txt_ocr(
+        input_pdfs_root,
+        output_txt_root=txt_root,
+        recursive=recursive,
+        overwrite=overwrite_txt,
+        work_root=out_root / "_work_tmp",
+        max_workers=max_workers,
+        pipeline_logger=pipeline_logger,
+    )
+    if pipeline_logger:
+        pipeline_logger.step_end("B1")
+
+    if pipeline_logger:
+        pipeline_logger.step_start("B2", "TXT -> JSON raw (convert_folder)")
+    convert_folder(
+        input_root=str(txt_root),
+        output_root=str(json_raw_root),
+        chunk_version=chunk_version,
+    )
+    if pipeline_logger:
+        pipeline_logger.step_end("B2")
+
+    if pipeline_logger:
+        pipeline_logger.step_start("B3", "JSON chunking + overlap")
+    process_json_folder(
+        input_root=str(json_raw_root),
+        output_root=str(json_chunked_root),
+        min_tokens=min_tokens,
+        target_tokens=target_tokens,
+        max_tokens=max_tokens,
+        overlap_units=overlap_units,
+        chunk_version=chunk_version,
+    )
+    if pipeline_logger:
+        pipeline_logger.step_end("B3")
+
     merged_path = ""
     if merge_all:
         if pipeline_logger:
@@ -653,29 +741,26 @@ def main_ocr() -> None:
     """
     Console entry point: `uv run chunk-pipeline-ocr`
 
-    olmOCR pipeline (B5 only): Skips Docling extraction (B1-B4) and uses
-    olmOCR server for text extraction. Applies to ALL PDFs in the input folder
-    (not just garbled-font ones).
-
-    Requires:
-    - B1 already run (raw_text.txt exists for TOC parsing)
-    - olmOCR server running at https://olmocr.aibuddy.vn/ocr
+    Full OCR pipeline (B1→B5): use olmOCR as the text extractor for all PDFs,
+    then continue with the normal B2/B3/B4 flow and B5 OCR export.
 
     Usage:
-        uv run chunk-pipeline-ocr [input_root]
+        uv run chunk-pipeline-ocr [input_root] [--max-workers N]
     """
-    import sys
+    import argparse
 
-    input_root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(r".\input")
+    parser = argparse.ArgumentParser(prog="chunk-pipeline-ocr")
+    parser.add_argument("input_root", nargs="?", default=r".\input")
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=3,
+        help="Number of concurrent PDF OCR requests in B1 (default: 3).",
+    )
+    args = parser.parse_args()
+
+    input_root = Path(args.input_root)
     subject, out_root = _detect_subject_and_out_root(input_root)
-
-    # Verify raw_text exists (B1 must have been run before)
-    work_tmp = out_root / "_work_tmp"
-    if not work_tmp.exists():
-        print(f"ERROR: {work_tmp} not found.")
-        print("You must run `chunk-pipeline` first (at least B1) to generate raw_text.txt for TOC parsing.")
-        print("Then re-run this command to use olmOCR for text extraction.")
-        sys.exit(1)
 
     # Initialize pipeline logger
     plog = PipelineLogger(subject=f"{subject}_ocr")
@@ -686,14 +771,31 @@ def main_ocr() -> None:
     print(f"olmOCR Pipeline — Subject: {subject}")
     print(f"Input: {input_root}")
     print(f"Output: {out_root}")
+    print(f"B1 OCR workers: {args.max_workers}")
     print("=" * 60)
-    print("\nSkipping B1-B4 (using existing raw_text for TOC).")
-    print("Using olmOCR server for ALL PDFs.\n")
+    print("\nRunning B1-B5 with olmOCR for ALL PDFs.\n")
 
-    # B5: Export ALL PDFs using olmOCR
+    paths = run_e2e_pdf_folder_to_chunked_json_ocr(
+        input_pdfs_root=str(input_root),
+        out_root=str(out_root),
+        recursive=True,
+        overwrite_txt=True,
+        max_workers=max(1, args.max_workers),
+        min_tokens=250,
+        target_tokens=400,
+        max_tokens=650,
+        overlap_units=2,
+        chunk_version="v1",
+        merge_all=True,
+        merged_out_version="v1",
+        pipeline_logger=plog,
+    )
+    print("DONE (B1-B4 OCR). Outputs:")
+    print(json.dumps(paths, ensure_ascii=False, indent=2))
+    plog.info("B1-B4 OCR completed.")
+
     _run_export_step(input_root, out_root, subject, use_olmocr=True, pipeline_logger=plog)
 
-    # Finalize log
     plog.finish()
 
 
