@@ -8,7 +8,7 @@ What story or change was validated?
 
 ## Commands Run
 
-```
+```text
 command
 ```
 

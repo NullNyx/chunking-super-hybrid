@@ -12,3 +12,4 @@ Add a decision when:
 - A validation requirement is added, removed, or weakened.
 - A high-risk feature chooses one design over another.
 - The source-of-truth hierarchy changes.
+

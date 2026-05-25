@@ -11,7 +11,7 @@ Use `docs/templates/story.md` for normal feature work.
 
 Suggested path:
 
-```
+```text
 docs/stories/epics/E01-domain-name/US-001-short-story-title.md
 ```
 
@@ -22,7 +22,7 @@ high-risk.
 
 Suggested path:
 
-```
+```text
 docs/stories/epics/E02-risky-domain/US-012-risky-story-title/
   execplan.md
   overview.md
@@ -32,7 +32,7 @@ docs/stories/epics/E02-risky-domain/US-012-risky-story-title/
 
 ## Status Flow
 
-```
+```text
 planned -> in_progress -> implemented
                   |
                   v

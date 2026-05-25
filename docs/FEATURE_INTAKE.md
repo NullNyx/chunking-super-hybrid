@@ -8,7 +8,7 @@ The human does not need to classify risk. The harness does.
 
 ## Intake Flow
 
-```
+```text
 User prompt
     |
     v
@@ -39,7 +39,7 @@ lane.
 | Change request | Changing, fixing, or refining accepted behavior | Story packet or direct patch |
 | New initiative | Adding a larger product area that needs multiple stories | Initiative notes plus story packets |
 | Maintenance request | Changing technical, operational, or dependency behavior | Story packet, validation report, or decision |
-| Harness improvement | Improving how humans and agents collaborate | Direct docs update or `docs/HARNESS_BACKLOG.md` |
+| Harness improvement | Improving how humans and agents collaborate | Direct docs update or `scripts/harness backlog add` |
 
 Do not create or extend a monolithic spec by default after intake. Use product
 docs, stories, decisions, and initiative notes as the living surface.
@@ -67,7 +67,8 @@ Requirements:
 - Link relevant product docs.
 - Add or update validation expectations.
 - Implement the smallest vertical slice when implementation exists.
-- Update `docs/TEST_MATRIX.md`.
+- Record or update proof status with `scripts/harness story add` and
+  `scripts/harness story update`.
 
 ### High-Risk
 
@@ -100,7 +101,7 @@ Mark one flag for each item that applies:
 
 ## Classification
 
-```
+```text
 0-1 flags:
   tiny or normal, based on code impact
 
@@ -127,7 +128,7 @@ Hard gates:
 
 At the end of intake, the agent should be able to say:
 
-```
+```text
 Lane: normal
 Reason: touches authorization, API contract, and audit behavior.
 Docs: permissions, account-settings, audit-log.
